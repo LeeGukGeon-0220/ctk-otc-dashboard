@@ -1,0 +1,17 @@
+# ※ 이 파일은 GitHub 에도 올라가 웹사이트(Streamlit Cloud)에서도 쓰입니다.
+#    port 같은 「내 PC 전용」 설정을 넣으면 웹사이트가 실행되지 않으니 넣지 마세요.
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+# 화면 기본 색 — 앱 안의 「밝은 화면 / 어두운 화면」 전환은 app.py 가 따로 처리합니다.
+# 여기 값은 라디오 버튼·입력창처럼 Streamlit 이 직접 그리는 부품의 기본색입니다.
+[theme]
+base = "light"
+primaryColor = "#E2611C"
+backgroundColor = "#F6F7F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#0B0B0B"
+font = "sans serif"

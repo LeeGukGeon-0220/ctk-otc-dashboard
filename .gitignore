@@ -1,0 +1,43 @@
+# 가상환경 / 캐시
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# 회사 재무자료 (절대 업로드 금지)
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.pdf
+~$*
+최근업로드.xlsx
+최근업로드_파일이름.txt
+최근원장.xlsx
+최근원장.xlsx.txt
+최근전월실적.xlsx
+최근전월실적.xlsx.txt
+최근패키지양식.xlsx
+최근패키지양식.xlsx.txt
+최근패키지.xlsx
+최근패키지.xlsx.txt
+자료실/
+_기억자료/
+작업자료/
+
+# Streamlit 비밀키
+.streamlit/secrets.toml
+
+# 기타
+.DS_Store
+Thumbs.db
+
+# 대표님 보고용 문서 — 공개 저장소에 올라가지 않도록
+보고서/
+*.docx
+*.doc
+
+# 배치파일·바로가기·점검 스크립트 — 웹에는 올리지 않습니다
+*.bat
+*.url
+smoke.py
