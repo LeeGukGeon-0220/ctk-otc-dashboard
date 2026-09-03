@@ -648,6 +648,11 @@ def _날짜열맞추기(칸):
             return pd.Timestamp(v).normalize()
         if isinstance(v, datetime.date):
             return pd.Timestamp(v)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            # 날짜 서식이 빠진 칸은 엑셀 일련번호(46196 같은 숫자)로 옵니다 — 그것도 날짜로 읽습니다
+            if 20000 < float(v) < 80000:
+                return pd.Timestamp(datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v)))
+            return pd.NaT
         p = str(v).strip().replace('-', '/').split('/')
         if len(p) != 3:
             return pd.NaT
@@ -2066,6 +2071,8 @@ def _날짜일련(v):
     """엑셀이 쓰는 날짜 일련번호로 바꿉니다 (YEAR·MONTH 수식이 돌아가려면 숫자여야 합니다)."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(v) if 20000 < float(v) < 80000 else None     # 이미 엑셀 일련번호
     if isinstance(v, str):
         p = v.strip().replace('-', '/').split('/')
         if len(p) != 3:
@@ -2418,6 +2425,32 @@ def _시트본뜨기(원본xml, 공유=()):
     return 앞, 뒤, 머리행, 서식표, 수식본
 
 
+def _날짜서식번호들(styles_xml):
+    """styles.xml 에서 날짜 표시 서식이 붙은 칸 서식(cellXfs) 번호 모음.
+
+    ※ 담당자가 괘선을 잡다가 계정 묶음의 마지막 줄 C칸 날짜 서식이 빠지면(숫자 46196 으로 보임)
+      그 서식번호를 그대로 따라 쓰지 않으려고 미리 알아 둡니다.
+    """
+    try:
+        사용자서식 = {}
+        for m in re.finditer(r'<numFmt numFmtId="(\d+)" formatCode="([^"]*)"', styles_xml):
+            사용자서식[int(m.group(1))] = _풀기(m.group(2)).lower()
+        내장날짜 = set(range(14, 23)) | set(range(45, 48))
+        cx = re.search(r'<cellXfs[^>]*>(.*?)</cellXfs>', styles_xml, re.S)
+        if not cx:
+            return set()
+        결과 = set()
+        for i, xf in enumerate(re.findall(r'<xf\b[^>]*?(?:/>|>.*?</xf>)', cx.group(1), re.S)):
+            fm = re.search(r'numFmtId="(\d+)"', xf)
+            fid = int(fm.group(1)) if fm else 0
+            코드 = 사용자서식.get(fid, '')
+            if fid in 내장날짜 or (fid >= 164 and 'y' in 코드 and 'd' in 코드):
+                결과.add(str(i))
+        return 결과
+    except Exception:
+        return set()
+
+
 def _칸서식(서식표, 유형, col):
     """줄 유형에 맞는 칸 서식 — 없으면 비슷한 유형의 것을 빌립니다."""
     for t in (유형,) + 줄유형대신.get(유형, ()):
@@ -2509,8 +2542,17 @@ def _값칸(열, r, sa, 수식, v):
     return f'<c r="{열}{r}"{sa}>{수식}<v>{float(v)!r}</v></c>'
 
 
-def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None, 공유=()):
+def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None, 공유=(), 날짜xf=()):
     앞, 뒤, 머리행, 서식표, 수식본 = _시트본뜨기(원본xml, 공유)
+    # C(거래일) 칸은 줄 유형이 무엇이든 날짜 서식이 붙은 서식만 씁니다
+    날짜칸서식 = {}
+    if 날짜xf:
+        기본C = next((서식표[t]['C'] for t in ('tx', 'lasttx', 'hdr', 'total', 'final')
+                      if 서식표.get(t, {}).get('C') in 날짜xf), None)
+        for t in 줄유형순서:
+            c = 서식표.get(t, {}).get('C')
+            if c is not None and c not in 날짜xf and 기본C is not None:
+                날짜칸서식[t] = 기본C
     # 전월 파일에서 수식이 지워진 칸은 본디 수식으로 되살립니다
     되살림 = [c for c in 기본수식본 if c not in 수식본]
     수식본 = {**{c: (기본수식본[c][0], _xml(기본수식본[c][1])) for c in 되살림}, **수식본}
@@ -2548,6 +2590,8 @@ def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None, �
         칸 = []
         for col in 전체열:
             s = _칸서식(서식표, 유형, col)
+            if col == 'C' and 유형 in 날짜칸서식:
+                s = 날짜칸서식[유형]
             if not s and col in 이어받기열:          # 비어 있던 열(검토 메모)은 옆 칸 서식을 빌립니다
                 s = _칸서식(서식표, 유형, 'X') or _칸서식(서식표, 유형, 'W')
             sa = f' s="{s}"' if s else ''
@@ -3415,7 +3459,11 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
     보고달 = 마지막.month
 
     # ── 4. 원장 시트를 갈아끼웁니다
-    새xml = _원장시트XML(z.read(올해파일).decode('utf-8'), 새, 이어받음, 기간글, 매핑표, 공유)
+    try:
+        날짜xf = _날짜서식번호들(z.read('xl/styles.xml').decode('utf-8'))
+    except KeyError:
+        날짜xf = set()
+    새xml = _원장시트XML(z.read(올해파일).decode('utf-8'), 새, 이어받음, 기간글, 매핑표, 공유, 날짜xf)
     끝행 = 5 + len(새)
     # 「당월 실적집계」는 그대로 두고, 기준 월(H2)만 이번 달로 맞춥니다.
     #   (OTC 실적자료는 시트 15개 구성을 그대로 유지합니다)
@@ -4734,8 +4782,8 @@ st.sidebar.markdown("""
             '연결재무제표 패키지', '실적보고 엑셀작성', '월간실적']
 # 「실적보고」를 누르면 아래 세 화면이 펼쳐집니다 (맨 처음은 누적 실적보고)
 실적하위 = ['누적 실적보고', '당월 실적보고', '월별 실적보고']
-# 「원가관리」 아래 화면 — 입고관리(재고 매입내역 vs 퀵북 원장 매입)
-원가하위 = ['입고관리']
+# 「원가관리」 아래 화면 — 매입관리(재고 매입내역 vs 퀵북 원장 매입) · 재고수불부
+원가하위 = ['매입관리', '재고수불부']
 # 「연결재무제표 패키지」도 같은 방식으로 네 화면을 거느립니다
 패키지하위 = ['재무제표', '주석사항']
 # 재무제표 화면 안에서 고르는 세 가지 (자동 번역을 막으려고 영문 약칭을 앞에 답니다)
@@ -5159,7 +5207,7 @@ def 자료종류(바이트):
     if any(re.search(r'ledger|원장', s, re.I) for s in 시트):
         return '원장'
     if any('매입' in s and ('원재료' in s or '부자재' in s) for s in 시트):
-        return '매입'                       # 재고 매입내역 (입고관리 화면)
+        return '매입'                       # 재고 매입내역 (매입관리·재고수불부 화면)
     return ''
 
 
@@ -6984,12 +7032,15 @@ elif 메뉴 == '월간실적':
                        '「■ 월별 목표」 구역에 넣으시면 자동으로 표시됩니다.')
 
 # ══════════════════════════════════════════════════════════════
-# 3-2. 원가관리 › 입고관리 — 재고 매입내역(입고량 × 단가) 과 퀵북 원장의 매입을 거래처별로 견줍니다
+# 3-2. 원가관리 › 매입관리 · 재고수불부 — 재고 매입내역(입고량 × 단가) 과 퀵북 원장의 매입
 # ══════════════════════════════════════════════════════════════
-elif 메뉴 == '입고관리':
-    st.write(f'### 원가관리 › 입고관리 — {당해연도}년 1~{보고월}월')
-    st.caption('재고 매입내역(원재료·부자재 입고량 × 단가표 단가) 과 퀵북 원장에 적힌 매입 금액을 '
-               '거래처별로 나란히 놓고 봅니다 · 통화 USD')
+elif 메뉴 in ('매입관리', '재고수불부'):
+    st.write(f'### 원가관리 › {메뉴} — {당해연도}년 1~{보고월}월')
+    if 메뉴 == '매입관리':
+        st.caption('재고 매입내역(원재료·부자재 입고량 × 단가표 단가) 과 퀵북 원장에 적힌 매입 금액을 '
+                   '거래처별로 나란히 놓고 봅니다 · 통화 USD')
+    else:
+        st.caption('품목별 수불부 — 입고는 재고 매입내역, 원장 매입금액과의 차이는 맨 아래 「재고조정」 줄로 맞춥니다 · 통화 USD')
 
     # ── 재고 매입내역 파일 (한 번 올리면 남겨 둡니다)
     매입있음, 매입이름, _크기, 매입때 = 보관자료(매입보관)
@@ -7079,6 +7130,100 @@ elif 메뉴 == '입고관리':
     벤더열 = 원장매입['Vendor'] if 'Vendor' in 원장매입.columns else pd.Series(np.nan, index=원장매입.index)
     원장매입['거래처'] = 벤더열.fillna(원장매입.get('Name')).fillna('(거래처 없음)').astype(str).str.strip()
 
+    # ── 원재료·부자재를 따로 견줄 때의 원장 쪽 몫
+    원장원재료 = 원장매입[원장매입['계정과목'].eq('원재료') | 원장매입['활동세부'].eq('원재료 매입')]
+    원장부자재 = 원장매입[원장매입['활동세부'].isin(['부자재 매입', '포장재'])]
+
+if 메뉴 == '재고수불부':
+    def 수불부(구분, 조정액):
+        """품목별 수불부 표 → DataFrame. 입고 = 매입내역(Purchase), 조정액이 있으면 맨 아래 「재고조정」 줄을 붙입니다."""
+        d = 산것[산것['구분'].eq(구분)]
+        g = (d.groupby(['코드', '자재명']).agg(입고수량=('입고량', 'sum'), 입고금액=('금액', 'sum'))
+             .reset_index().sort_values('입고금액', ascending=False))
+        표 = pd.DataFrame({'품목코드': g['코드'], '품목명': g['자재명'],
+                          '기초수량': 0.0, '기초금액': 0.0,
+                          '입고수량': g['입고수량'].astype(float), '입고금액': g['입고금액'].astype(float),
+                          '출고수량': 0.0, '출고금액': 0.0, '조정수량': 0.0, '조정금액': 0.0})
+        if 조정액 is not None:
+            표 = pd.concat([표, pd.DataFrame([{'품목코드': '', '품목명': '재고조정 (원장 매입금액과의 차이)',
+                                              '기초수량': 0.0, '기초금액': 0.0, '입고수량': np.nan, '입고금액': 조정액,
+                                              '출고수량': 0.0, '출고금액': 0.0, '조정수량': 0.0, '조정금액': 0.0}])],
+                           ignore_index=True)
+        표['기말수량'] = 표['기초수량'] + 표['입고수량'].fillna(0) - 표['출고수량'] + 표['조정수량']
+        표['기말재고'] = 표['기초금액'] + 표['입고금액'] - 표['출고금액'] + 표['조정금액']
+        return 표
+
+    def 수불부표(제목, 표, 설명):
+        수량 = lambda v: '' if (v is None or pd.isna(v)) else (f'{v:,.2f}'.rstrip('0').rstrip('.') if abs(v) % 1 else f'{v:,.0f}')
+        줄들 = ''
+        for _i, r in 표.iterrows():
+            조정줄 = r['품목코드'] == '' and '재고조정' in str(r['품목명'])
+            꼴 = f' style="color:{ROSE}"' if 조정줄 else ''
+            줄들 += (f'<tr class="sub"><td class="lft">{r["품목코드"]}</td><td class="lft"{꼴}>{r["품목명"]}</td>'
+                     f'<td>{수량(r["기초수량"])}</td><td>{금액(r["기초금액"])}</td>'
+                     f'<td>{수량(r["입고수량"])}</td><td{꼴}>{금액(r["입고금액"])}</td>'
+                     f'<td>{수량(r["출고수량"])}</td><td>{금액(r["출고금액"])}</td>'
+                     f'<td>{수량(r["조정수량"])}</td><td>{금액(r["조정금액"])}</td>'
+                     f'<td>{수량(r["기말수량"])}</td><td><b>{금액(r["기말재고"])}</b></td></tr>')
+        합 = {c: float(표[c].sum()) for c in ('기초수량', '기초금액', '입고수량', '입고금액', '출고수량', '출고금액',
+                                              '조정수량', '조정금액', '기말수량', '기말재고')}
+        st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
+          <div class="card"><h3>{제목} <span class="unitbadge">단위 USD</span></h3>
+            <div class="sub">{당해연도}년 1~{보고월}월 · 입고 = 재고 매입내역(발주유형 Purchase · 입고량 × 단가표 단가) · {설명} ·
+              기초·출고·조정은 자료를 받으면 채웁니다 (지금은 0)</div>
+            <div class="stick" style="max-height:620px; overflow:auto"><table class="lined" style="min-width:1240px; margin-top:8px">
+              <colgroup><col style="width:9%"><col style="width:23%">{'<col style="width:6.8%">' * 10}</colgroup>
+              <thead><tr><th>품목코드</th><th>품목명</th><th>기초수량</th><th>기초금액</th><th>입고수량</th><th>입고금액</th>
+                <th>출고수량</th><th>출고금액</th><th>조정수량</th><th>조정금액</th><th>기말수량</th><th>기말재고</th></tr></thead>
+              <tbody>{줄들}
+                <tr class="total"><td class="lft">합계</td><td class="lft">{int(표['품목코드'].ne('').sum()):,}개 품목</td>
+                  <td>{수량(합['기초수량'])}</td><td>{금액(합['기초금액'])}</td>
+                  <td>{수량(합['입고수량'])}</td><td><b>{금액(합['입고금액'])}</b></td>
+                  <td>{수량(합['출고수량'])}</td><td>{금액(합['출고금액'])}</td>
+                  <td>{수량(합['조정수량'])}</td><td>{금액(합['조정금액'])}</td>
+                  <td>{수량(합['기말수량'])}</td><td><b>{금액(합['기말재고'])}</b></td></tr></tbody></table></div>
+          </div></div>""")
+
+    # 퀵북 재고 계정(1310·1320)에는 원재료와 부자재 매입이 함께 들어 있어 원장 쪽은 둘로 나눌 수 없습니다.
+    #  → 원장 매입금액 전체와 매입내역(원재료+부자재) 전체의 차이를 「원재료 수불부」 맨 아래 재고조정 한 줄로 맞춥니다.
+    원장합계 = float(원장매입['순매입'].sum())
+    매입내역합계 = float(산것['금액'].sum())
+    조정액 = 원장합계 - 매입내역합계
+    원재료표 = 수불부('원재료', 조정액)
+    부자재표 = 수불부('부자재', None)
+    원재료입고 = float(산것.loc[산것['구분'].eq('원재료'), '금액'].sum())
+    부자재입고 = 매입내역합계 - 원재료입고
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="kpi-row" style="--n:5">
+      <div class="kpi-card"><div class="kpi-label">원재료 입고 (매입내역)</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원재료입고)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">부자재 입고 (매입내역)</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(부자재입고)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">매입내역 합계</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(매입내역합계)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">재고조정 (원장 − 매입내역)</div>
+        <div class="kpi-value {'warn' if abs(조정액) > 1 else 'ok'}" style="font-size:24px;font-weight:700">{금액(조정액)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">퀵북 원장 매입 = 수불부 입고금액 합계</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원장합계)} <span class="unit">USD</span></div></div>
+    </div></div>""")
+    수불부표('원재료 수불부', 원재료표,
+           f'맨 아래 「재고조정」 {금액(조정액)} 은 퀵북 원장 매입금액 {금액(원장합계)} 과 매입내역(원재료+부자재) {금액(매입내역합계)} 의 차이 — '
+           f'이 줄을 더하면 두 수불부의 입고금액 합계가 원장과 같습니다')
+    수불부표('부자재 수불부', 부자재표, '재고조정은 원재료 수불부 한 줄로 맞춥니다 (퀵북 재고 계정은 원재료·부자재를 나누지 않습니다)')
+
+    # 엑셀 내려받기
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as xw:
+        원재료표.to_excel(xw, sheet_name='원재료 수불부', index=False)
+        부자재표.to_excel(xw, sheet_name='부자재 수불부', index=False)
+    st.download_button('재고수불부 엑셀 내려받기', data=buf.getvalue(),
+                       file_name=f'OTC 재고수불부_{당해연도}년 1~{보고월}월.xlsx',
+                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key='수불부다운')
+    st.caption('원장 쪽 매입 = 재고(1300·1310·1320) 계정으로 들어온 Bill·Expense·Vendor Credit + 5100 Purchases + 5850 Packing Supplies '
+               '(재고 조정 분개·Invoice 제외) — 「매입관리」 화면의 원장 매입과 같은 금액입니다. '
+               '기초수량·금액과 출고(생산 소요)는 자료를 받으면 채웁니다.')
+    st.stop()
+
+if 메뉴 == '매입관리':
     # ── 거래처 이름 맞추기 (두 자료의 표기가 다릅니다: Univar ↔ Univar (Nexeo) Solution)
     군더더기 = {'inc', 'llc', 'corp', 'co', 'ltd', 'company', 'solution', 'solutions', 'us', 'usa',
                'the', 'of', 'america', 'group', 'lab', 'labs', 'korea', 'hq'}
