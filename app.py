@@ -620,6 +620,47 @@ def _parse_dmy(v):
         return pd.NaT
 
 
+def _날짜열맞추기(칸):
+    """날짜 열 하나를 통째로 진짜 날짜로 바꿉니다 (미국 퀵북은 「월/일/연도」 글자입니다).
+
+    ※ 한 칸만 보고는 3/4/2026 이 3월 4일인지 4월 3일인지 알 수 없어서, 열 전체를 먼저 훑어
+      13 이상이 앞에 오면 「일/월/연도」, 뒤에 오면 「월/일/연도」로 정합니다.
+      어느 쪽으로도 판가름이 안 나면 OTC 는 미국 법인이라 「월/일/연도」로 읽습니다.
+    """
+    값들 = list(칸)
+    조각들 = []
+    for v in 값들:
+        if isinstance(v, str):
+            p = v.strip().replace('-', '/').split('/')
+            if len(p) == 3 and all(x.strip().isdigit() for x in p):
+                조각들.append((int(p[0]), int(p[1]), int(p[2])))
+    일먼저 = any(a > 12 for a, b, c in 조각들) and not any(b > 12 for a, b, c in 조각들)
+
+    def _하나(v):
+        if v is None:
+            return pd.NaT
+        try:
+            if pd.isna(v):
+                return pd.NaT
+        except (TypeError, ValueError):
+            pass
+        if isinstance(v, (datetime.datetime, pd.Timestamp)):
+            return pd.Timestamp(v).normalize()
+        if isinstance(v, datetime.date):
+            return pd.Timestamp(v)
+        p = str(v).strip().replace('-', '/').split('/')
+        if len(p) != 3:
+            return pd.NaT
+        try:
+            a, b, c = int(p[0]), int(p[1]), int(p[2])
+            if c < 100:                      # 26 → 2026
+                c += 2000
+            return pd.Timestamp(c, a, b) if not 일먼저 else pd.Timestamp(c, b, a)
+        except Exception:
+            return pd.NaT
+    return pd.Series([_하나(v) for v in 값들], index=getattr(칸, 'index', None))
+
+
 def 재분류읽기(xls):
     """「재분류」 시트 — 특정 전표만 다른 계정으로 보이게 하는 규칙.
 
@@ -653,7 +694,7 @@ def 재분류읽기(xls):
 def _표준화(df, 매핑표, 연도힌트, 재분류=None):
     """v6 / v7 어느 양식이든 같은 컬럼 이름으로 맞춥니다."""
     ren = {'Distribution account': '계정영문', 'Transaction date': '거래일',
-           'Transaction ID': 'TransactionID', '#': '전표번호',
+           'Transaction ID': 'TransactionID', '#': '전표번호', 'Num': '전표번호',
            '계정분류(BS/IS)': '계정분류'}
     df = df.rename(columns={k: v for k, v in ren.items() if k in df.columns})
     if '계정영문' not in df.columns:
@@ -662,7 +703,7 @@ def _표준화(df, 매핑표, 연도힌트, 재분류=None):
     df['계정영문'] = df['계정영문'].astype(str).str.strip()
     df = df[~df['계정영문'].isin(['', 'nan', 'Beginning Balance'])]
 
-    df['거래일'] = df['거래일'].apply(_parse_dmy)
+    df['거래일'] = _날짜열맞추기(df['거래일'])
     df = df[df['거래일'].notna()].copy()
 
     for c in ('Debit', 'Credit'):
@@ -1520,7 +1561,7 @@ def _기타입금줄(df, 현금행, 차변):
     if not 기타입금단어:
         return pd.Series(False, index=df.index)
     글 = pd.Series('', index=df.index)
-    for c in ('Description', '#'):
+    for c in ('Description', '#', 'Num'):
         if c in df.columns:
             글 = 글 + ' ' + df[c].fillna('').astype(str)
     들어옴 = pd.to_numeric(차변, errors='coerce').fillna(0) > 0
@@ -2001,13 +2042,19 @@ _행패턴 = re.compile(r'<row\b[^>]*\br="(\d+)"[^>]*>.*?</row>|<row\b[^>]*\br="
 _칸패턴 = re.compile(r'<c r="([A-Z]+)\d+"([^>]*?)(?:/>|>(.*?)</c>)', re.S)
 _수식패턴 = re.compile(r'<f([^>]*?)>(.*?)</f>', re.S)
 
+# 원장 시트 배치 (OTC 실적자료 양식)
+#   A~P  = 퀵북 「General Ledger」 를 내려받은 그대로 (Customer · Vendor 포함, 열 순서도 그대로)
+#   Q~AA = 클로드가 덧붙이는 집계열
+#     Q 금액 · R 년 · S 월 · T 계정분류 · U 분류 · V 계정과목 · Z 보고금액 · AA 월(숫자) → 수식으로 저절로
+#     W 활동분류 · X 활동세부 → BS_IS_매핑 E·F 열에서 계정별로 찾되, 전월에 손으로 고친 것이 있으면 그것을 이어받음
+#     Y 클로드 검토 → 전월 메모 이어받음
 원장열자리 = {'A': 'Unnamed: 0', 'B': 'Distribution account', 'C': 'Transaction date',
-              'D': 'Description', 'E': 'Name', 'F': 'Transaction ID', 'G': '#',
-              'H': 'Balance', 'I': 'Debit', 'J': 'Credit'}
-전체열 = list('ABCDEFGHIJKLMNOPQRSTUV')
-자동수식열 = ['K', 'L', 'M', 'N', 'O', 'P', 'U', 'V']
-이어받기열 = {'Q': '활동분류', 'R': '활동세부',
-              'S': '클로드 검토', 'T': '보고금액'}
+              'D': 'Transaction type', 'E': 'Num', 'F': 'Name', 'G': 'Description', 'H': 'Split',
+              'I': 'Debit', 'J': 'Credit', 'K': 'Amount', 'L': 'Balance', 'M': 'Customer',
+              'N': 'Vendor', 'O': 'Line created date', 'P': 'Transaction ID'}
+전체열 = list('ABCDEFGHIJKLMNOPQRSTUVWXYZ') + ['AA']
+자동수식열 = ['Q', 'R', 'S', 'T', 'U', 'V', 'Z', 'AA']
+이어받기열 = {'W': '활동분류', 'X': '활동세부', 'Y': '클로드 검토'}
 
 
 def _xml(s):
@@ -2023,8 +2070,11 @@ def _날짜일련(v):
         p = v.strip().replace('-', '/').split('/')
         if len(p) != 3:
             return None
-        try:
-            d = datetime.date(int(p[2]), int(p[1]), int(p[0]))
+        try:                                  # 미국 퀵북 「월/일/연도」 — 앞이 13 이상이면 「일/월/연도」
+            a, b, c = int(p[0]), int(p[1]), int(p[2])
+            if c < 100:
+                c += 2000
+            d = datetime.date(c, b, a) if a > 12 else datetime.date(c, a, b)
         except Exception:
             return None
     else:
@@ -2045,21 +2095,30 @@ def _이어받기키(df):
       적요(Description)까지 넣고, 그래도 겹치면 그 안에서의 순번을 붙여 갈라 냅니다.
       순번을 안 붙이면 둘 중 하나의 분류가 엉뚱한 줄에 붙습니다.
     """
-    k = df['Distribution account'].fillna('∅').astype(str).str.strip()
-    for c in ('Transaction ID', 'Debit', 'Credit'):
-        k = k + '|' + pd.to_numeric(df.get(c), errors='coerce').round(2).fillna(-1).astype(str)
-    for c in ('Name', 'Description'):
-        칸 = df[c] if c in df.columns else pd.Series(index=df.index, dtype=object)
-        k = k + '|' + 칸.fillna('∅').astype(str).str.strip()
-    k = k + '|' + df['Transaction date'].map(lambda v: str(_날짜일련(v)))
-    return k + '#' + k.groupby(k).cumcount().astype(str)
+    def _글(c):
+        return [('∅' if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v).strip())
+                for v in (df[c] if c in df.columns else [None] * len(df))]
+
+    def _수(c):                                   # 빈칸과 0.00 은 같은 것으로 봅니다
+        return [str(v) for v in pd.to_numeric(df.get(c), errors='coerce').round(2).fillna(0)]
+    조각 = [_글('Distribution account')] + [_수(c) for c in ('Transaction ID', 'Debit', 'Credit')]
+    조각 += [_글('Name'), _글('Description')]
+    조각.append([str(_날짜일련(v)) for v in (df['Transaction date'] if 'Transaction date' in df.columns
+                                            else [None] * len(df))])
+    본 = ['|'.join(x) for x in zip(*조각)] if len(df) else []
+    본것 = collections.Counter()
+    키 = []
+    for k in 본:
+        키.append(f'{k}#{본것[k]}')
+        본것[k] += 1
+    return pd.Series(키, index=df.index, dtype=object)
 
 
 # ── 새 거래를 스스로 나눠 주는 부분 ────────────────────────────
 #    전월 자료에 없던 거래는 활동분류·활동세부가 비어 있어서, 그대로 두면
 #    「월별 실적집계」의 SUMIFS 가 그 줄을 못 세고 이번 달 칸이 0 으로 남습니다.
 #    그래서 지난달까지 사람이 나눠 놓은 것을 배워서 새 줄에 붙이고,
-#    확실하지 않은 것은 T열 「클로드 검토」에 왜 그렇게 붙였는지 적어 둡니다.
+#    확실하지 않은 것은 Y열 「클로드 검토」에 왜 그렇게 붙였는지 적어 둡니다.
 _숫자토막 = re.compile(r'\d+')
 _공백토막 = re.compile(r'\s+')
 
@@ -2118,23 +2177,29 @@ def _분류학습(전):
     return 적요, 거래처, 계정, 본줄
 
 
-def _자동분류(새, 이어받음, 배움, 유효세부, 매핑분류):
-    """이어받지 못한 줄의 Q·R 을 채우고, 그 근거를 T 에 적습니다.
+def _자동분류(새, 이어받음, 배움, 유효세부, 매핑표):
+    """이어받지 못한 줄의 W·X(활동분류·활동세부)를 채우고, 그 근거를 Y(클로드 검토)에 적습니다.
 
     유효세부 : 「월별 실적집계」가 실제로 세는 활동세부 이름 모음
-    매핑분류 : BS_IS_매핑의 계정 → 'BS' / 'IS'
+    매핑표   : BS_IS_매핑의 계정 → (BS/IS, 한글, 활동분류, 활동세부)
     돌려주는 값 : 근거별 건수 dict
+
+    ※ OTC 는 계정마다 활동분류·활동세부가 하나로 정해져 있어(BS_IS_매핑 E·F 열),
+      그 표에 있는 계정은 원장 W·X 수식이 알아서 채웁니다 → 여기서는 세기만 하고 메모를 남기지 않습니다.
+      표에 활동세부가 없는 계정만 지난달 분류를 배워서 붙입니다.
     """
     적요, 거래처, 계정, 본줄 = 배움
+    매핑분류 = {k: v[0] for k, v in 매핑표.items()}
+    기준세부 = {k: (v[2], v[3]) for k, v in 매핑표.items() if len(v) > 3 and v[3]}
     계정칸 = _글자칸(새, 'Distribution account')
     적요칸 = [_글자정리(v) for v in _글자칸(새, 'Description')]
     이름칸 = [_글자정리(v) for v in _글자칸(새, 'Name')]
     날짜칸 = 새['Transaction date'].tolist()
 
     센것 = collections.Counter()
-    메모 = 이어받음.setdefault('T', [None] * len(새))
-    Q칸 = 이어받음.setdefault('Q', [None] * len(새))
-    R칸 = 이어받음.setdefault('R', [None] * len(새))
+    메모 = 이어받음.setdefault('Y', [None] * len(새))
+    Q칸 = 이어받음.setdefault('W', [None] * len(새))      # 활동분류
+    R칸 = 이어받음.setdefault('X', [None] * len(새))      # 활동세부
     for i in range(len(새)):
         a = 계정칸[i]
         if not a:
@@ -2147,6 +2212,14 @@ def _자동분류(새, 이어받음, 배움, 유효세부, 매핑분류):
             센것['매핑밖'] += 1
         if R칸[i]:
             센것['이어받음'] += 1
+            continue
+        if a in 기준세부:                      # 계정 기준표가 있으면 수식이 채웁니다
+            센것['계정기준표'] += 1
+            if 유효세부 and 기준세부[a][1] not in 유효세부:
+                센것['집계밖'] += 1
+                if not 메모[i]:
+                    메모[i] = (f'BS_IS_매핑의 활동세부 「{기준세부[a][1]}」가 '
+                               f'「월별 실적집계」에 없습니다 — 집계에서 빠집니다')
             continue
 
         짝, 근거, 급함 = None, '', False
@@ -2259,45 +2332,101 @@ def _시트칸읽기(z, 파일, 열들, 공유):
 
 
 def _매핑표읽기(z, 파일, 공유):
-    """BS_IS_매핑 시트에서 「계정 이름 → (BS/IS, 한글 계정과목)」을 읽습니다."""
+    """BS_IS_매핑 시트에서 「계정 이름 → (BS/IS, 한글 계정과목, 활동분류, 활동세부)」를 읽습니다.
+
+    ※ E·F 열(활동분류·활동세부)은 OTC 실적자료에만 있습니다. 없으면 빈 글자로 둡니다.
+    """
     지도 = {}
-    for _행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C'), 공유).items():
+    for 행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C', 'E', 'F'), 공유).items():
+        if 행 == 1:
+            continue
         이름 = str(칸.get('A', '')).strip()
         if 이름:
             지도[이름] = (str(칸.get('B', '')).strip().upper(),
-                          str(칸.get('C', '')).strip())
+                          str(칸.get('C', '')).strip(),
+                          str(칸.get('E', '')).strip(),
+                          str(칸.get('F', '')).strip())
     return 지도
 
 
-def _시트본뜨기(원본xml):
-    """원본 원장 시트에서 1~5행 · 칸 서식번호 · 수식 본을 뽑아냅니다."""
+# 원장 시트의 줄 유형 — 담당자가 잡아 둔 서식(점선 세로줄 · 계정 묶음 위아래 가는 실선)을 그대로 따라 쓰려고 나눕니다.
+#   hdr    : 계정 이름 줄 (A열만 있음)        → 묶음의 시작, 위쪽 가는 선
+#   tx     : 거래 줄 (B열 계정 있음)
+#   lasttx : 묶음의 마지막 거래 줄            → 아래쪽 가는 선
+#   total  : 「Total for …」 줄               → 위아래 가는 선
+#   final  : 시트 맨 마지막 Total 줄          → 아래쪽 실선
+줄유형순서 = ['hdr', 'tx', 'lasttx', 'total', 'final']
+줄유형대신 = {'lasttx': ('tx',), 'final': ('total', 'hdr', 'tx'), 'total': ('hdr', 'tx'), 'hdr': ('total', 'tx'), 'tx': ('lasttx',)}
+
+
+def _줄유형(A글, B있음):
+    """A열 글자 목록 · B열 있음/없음 목록 → 줄 유형 목록."""
+    유형 = []
+    for i in range(len(B있음)):
+        if B있음[i]:
+            다음 = B있음[i + 1] if i + 1 < len(B있음) else False
+            유형.append('tx' if 다음 else 'lasttx')
+        else:
+            유형.append('total' if str(A글[i] or '').strip().lower().startswith('total') else 'hdr')
+    if 유형 and 유형[-1] == 'total':
+        유형[-1] = 'final'
+    return 유형
+
+
+def _시트본뜨기(원본xml, 공유=()):
+    """원본 원장 시트에서 1~5행 · 줄 유형별 칸 서식번호 · 수식 본을 뽑아냅니다."""
     앞, 나머지 = 원본xml.split('<sheetData>', 1)
     본문, 뒤 = 나머지.rsplit('</sheetData>', 1)
-    머리행, 그룹서식, 자료서식, 수식본 = {}, {}, {}, {}
+    머리행, 수식본 = {}, {}
+    줄들 = []                                  # (A글, B있음, {열: 서식})
     for m in _행패턴.finditer(본문):
         r = int(m.group(1) or m.group(2))
         조각 = m.group(0)
         if r <= 5:
             머리행[r] = 조각
             continue
-        칸 = {}
+        칸, A글, B있음 = {}, '', False
         for cm in _칸패턴.finditer(조각):
             col, attrs, body = cm.group(1), cm.group(2), cm.group(3) or ''
             if col not in 전체열:
                 continue
-            s = re.search(r's="(\d+)"', attrs)
-            칸[col] = (s.group(1) if s else None, body)
+            sm = re.search(r's="(\d+)"', attrs)
+            if sm:
+                칸[col] = sm.group(1)
+            값있음 = bool(re.search(r'<v>[^<]', body) or '<is>' in body)
+            if col == 'A' and 값있음:
+                vm = re.search(r'<v>(.*?)</v>', body)
+                if vm and ' t="s"' in attrs and vm.group(1).isdigit() and int(vm.group(1)) < len(공유):
+                    A글 = 공유[int(vm.group(1))]
+                else:
+                    A글 = _풀기(re.sub(r'<[^>]+>', '', body))
+            if col == 'B' and 값있음:
+                B있음 = True
             fm = _수식패턴.search(body)
             if fm and col not in 수식본 and fm.group(2).strip():
                 수식본[col] = (r, fm.group(2))
-        표 = 그룹서식 if 칸.get('B', (None, ''))[1] in ('', None) else 자료서식
-        if not 표:
-            for col, (s, _b) in 칸.items():
-                if s:
-                    표[col] = s
-        if 그룹서식 and 자료서식 and len(수식본) >= 10:
-            break
-    return 앞, 뒤, 머리행, 그룹서식, 자료서식, 수식본
+        줄들.append((A글, B있음, 칸))
+    # 줄 유형별 · 칸별로 가장 많이 쓰인 서식을 고릅니다
+    #  (엑셀은 값이 있는 칸과 빈 칸에 조금 다른 서식번호를 붙여 두기도 하고, 「Beginning Balance」 줄처럼
+    #   날짜 서식이 없는 줄이 맨 앞에 오기도 해서, 처음 것을 쓰면 날짜가 숫자로 보입니다)
+    센것 = {t: {} for t in 줄유형순서}
+    if 줄들:
+        for (A글, B있음, 칸), t in zip(줄들, _줄유형([x[0] for x in 줄들], [x[1] for x in 줄들])):
+            for col, sv in 칸.items():
+                센것[t].setdefault(col, collections.Counter())[sv] += 1
+    서식표 = {t: {col: c.most_common(1)[0][0] for col, c in 표.items()} for t, 표 in 센것.items()}
+    return 앞, 뒤, 머리행, 서식표, 수식본
+
+
+def _칸서식(서식표, 유형, col):
+    """줄 유형에 맞는 칸 서식 — 없으면 비슷한 유형의 것을 빌립니다."""
+    for t in (유형,) + 줄유형대신.get(유형, ()):
+        if 서식표.get(t, {}).get(col):
+            return 서식표[t][col]
+    for t in 줄유형순서:
+        if 서식표.get(t, {}).get(col):
+            return 서식표[t][col]
+    return None
 
 
 def _수식옮기기(본, 원행, 새행):
@@ -2310,66 +2439,63 @@ def _수식옮기기(본, 원행, 새행):
 #  ※ 올려 주신 전월 파일에서 어느 칸의 수식이 지워져 있으면 여기 것으로 되살립니다.
 #    (한 번 값만 남은 파일을 다시 넣으면 그 칸이 통째로 비어 버리던 것을 막습니다)
 _되살린열 = []          # 이번에 되살린 칸 (화면에 알려 주려고 남깁니다)
+def _분류수식(칸):
+    """U열 「분류」 수식 — 대시보드가 쓰는 계정 목록(매출·매출원가·영업외·법인세)과 같은 기준입니다."""
+    def _또는(목록):
+        return 'OR(' + ','.join(f'{칸}="{a}"' for a in 목록) + ')'
+    return (f'IF(T{칸[1:]}<>"IS","",IF({_또는(매출계정)},"매출",IF({_또는(매출원가계정)},"매출원가",'
+            f'IF({_또는(영업외계정)},"영업외손익",IF({_또는(법인세계정)},"법인세","판관비")))))')
+
+
 기본수식본 = {
-    'K': (6, 'IF(C6="","",J6-I6)'),
-    'L': (6, 'IF(C6="","",YEAR(C6)&amp;"년")'),
-    'M': (6, 'IF(C6="","",MONTH(C6)&amp;"월")'),
-    'N': (6, 'IFERROR(INDEX(BS_IS_매핑!$B:$B,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
-    'O': (6, 'IF(N6&lt;&gt;"IS","",IF(OR(P6="제품매출",P6="기타매출"),"매출",'
-             'IF(P6="제품매출원가","매출원가",IF(OR(P6="이자비용",P6="잡손실",P6="잡이익",'
-             'P6="외환차익",P6="외환차손",P6="외화환산이익",P6="외화환산손실",'
-             'P6="유형자산처분손실"),"영업외손익","판관비"))))'),
-    'P': (6, 'IFERROR(INDEX(BS_IS_매핑!$C:$C,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
-    'Q': (6, 'IF(P6="제품매출","친환경 바이오 소재",'
-             'IF(P6="기타매출","기술 서비스 및 자문",""))'),
-    'R': (6, 'IF(P6="제품매출","친환경 빨대/원자재 및 부자재 공급",'
-             'IF(P6="기타매출","R&amp;D용역",""))'),
-    'U': (8, 'IF($C8="","",IF($O8="매출",$J8-$I8,$I8-$J8))'),
-    'V': (8, 'IF($C8="","",MONTH($C8))'),
+    'Q': (6, 'IF(C6="","",J6-I6)'),
+    'R': (6, 'IF(C6="","",YEAR(C6)&"년")'),
+    'S': (6, 'IF(C6="","",MONTH(C6)&"월")'),
+    'T': (6, 'IFERROR(INDEX(BS_IS_매핑!$B:$B,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
+    'U': (6, _분류수식('V6')),
+    'V': (6, 'IFERROR(INDEX(BS_IS_매핑!$C:$C,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
+    'W': (6, 'IF(C6="","",IFERROR(INDEX(BS_IS_매핑!$E:$E,MATCH(B6,BS_IS_매핑!$A:$A,0))&"",""))'),
+    'X': (6, 'IF(C6="","",IFERROR(INDEX(BS_IS_매핑!$F:$F,MATCH(B6,BS_IS_매핑!$A:$A,0))&"",""))'),
+    'Z': (6, 'IF($C6="","",IF($U6="매출",$J6-$I6,$I6-$J6))'),
+    'AA': (6, 'IF($C6="","",MONTH($C6))'),
 }
 
 
 def _수식값미리계산(새, 이어받음, 매핑표, 날짜):
-    """K~V 수식이 낼 값을 파이썬으로 미리 구해 칸에 같이 적어 둡니다.
+    """Q~AA 수식이 낼 값을 파이썬으로 미리 구해 칸에 같이 적어 둡니다.
 
     ※ 엑셀은 수식만 있고 계산값이 없으면, 다시 계산하기 전까지 그 칸을 빈칸으로 보여 줍니다.
-      원장이 1만 줄이라 계산이 오래 걸려서, 내려받아 열면 K~T 가 한동안 비어 보였습니다.
+      원장이 수천 줄이라 계산이 오래 걸려서, 내려받아 열면 Q~AA 가 한동안 비어 보였습니다.
       그래서 값을 미리 넣어 둡니다 (수식은 그대로라 나중에 다시 계산해도 같은 값입니다).
     """
-    영업외 = {'이자비용', '잡손실', '잡이익', '외환차익', '외환차손',
-              '외화환산이익', '외화환산손실', '유형자산처분손실'}
     계정 = _글자칸(새, 'Distribution account')
     차변 = pd.to_numeric(새.get('Debit'), errors='coerce').fillna(0).tolist()
     대변 = pd.to_numeric(새.get('Credit'), errors='coerce').fillna(0).tolist()
     값 = {c: [] for c in 자동수식열}
+    Q, R = [], []
     for i in range(len(새)):
         d = 날짜[i]
         비었다 = d is None
         날 = None if 비었다 else 엑셀기준일 + datetime.timedelta(days=d)
-        b, k = 계정[i], 계정[i].lower()
-        bs, kor = 매핑표.get(b, ('', ''))
+        b = 계정[i]
+        bs, kor, 활동, 세부 = (tuple(매핑표.get(b, ())) + ('', '', '', ''))[:4]
         분류 = ''
         if bs == 'IS':
-            분류 = ('매출' if kor in ('제품매출', '기타매출')
-                    else '매출원가' if kor == '제품매출원가'
-                    else '영업외손익' if kor in 영업외 else '판관비')
-        값['K'].append('' if 비었다 else 대변[i] - 차변[i])
-        값['L'].append('' if 비었다 else f'{날.year}년')
-        값['M'].append('' if 비었다 else f'{날.month}월')
-        값['N'].append(bs if b else '')
-        값['O'].append(분류)
-        값['P'].append(kor if b else '')
-        값['U'].append('' if 비었다 else
+            분류 = ('매출' if kor in 매출계정
+                    else '매출원가' if kor in 매출원가계정
+                    else '영업외손익' if kor in 영업외계정
+                    else '법인세' if kor in 법인세계정 else '판관비')
+        값['Q'].append('' if 비었다 else 대변[i] - 차변[i])
+        값['R'].append('' if 비었다 else f'{날.year}년')
+        값['S'].append('' if 비었다 else f'{날.month}월')
+        값['T'].append(bs if b else '')
+        값['U'].append(분류)
+        값['V'].append(kor if b else '')
+        값['Z'].append('' if 비었다 else
                        (대변[i] - 차변[i] if 분류 == '매출' else 차변[i] - 대변[i]))
-        값['V'].append('' if 비었다 else 날.month)
-    # Q·R 은 매출 계정이면 수식이 값을 만들어 냅니다 — 그 값도 같이 적어 둡니다
-    Q, R = [], []
-    for i in range(len(새)):
-        kor = 매핑표.get(계정[i], ('', ''))[1]
-        Q.append('친환경 바이오 소재' if kor == '제품매출'
-                 else '기술 서비스 및 자문' if kor == '기타매출' else '')
-        R.append('친환경 빨대/원자재 및 부자재 공급' if kor == '제품매출'
-                 else 'R&D용역' if kor == '기타매출' else '')
+        값['AA'].append('' if 비었다 else 날.month)
+        Q.append('' if 비었다 else 활동)
+        R.append('' if 비었다 else 세부)
     return 값, Q, R
 
 
@@ -2383,11 +2509,11 @@ def _값칸(열, r, sa, 수식, v):
     return f'<c r="{열}{r}"{sa}>{수식}<v>{float(v)!r}</v></c>'
 
 
-def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None):
-    앞, 뒤, 머리행, 그룹서식, 자료서식, 수식본 = _시트본뜨기(원본xml)
+def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None, 공유=()):
+    앞, 뒤, 머리행, 서식표, 수식본 = _시트본뜨기(원본xml, 공유)
     # 전월 파일에서 수식이 지워진 칸은 본디 수식으로 되살립니다
     되살림 = [c for c in 기본수식본 if c not in 수식본]
-    수식본 = {**{c: 기본수식본[c] for c in 되살림}, **수식본}
+    수식본 = {**{c: (기본수식본[c][0], _xml(기본수식본[c][1])) for c in 되살림}, **수식본}
     _되살린열.clear()
     _되살린열.extend(sorted(되살림))
 
@@ -2411,16 +2537,19 @@ def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None):
     if 매핑표:
         미리값, 미리Q, 미리R = _수식값미리계산(새, 이어받음, 매핑표, 날짜)
 
+    B있음 = [not (b is None or (isinstance(b, float) and pd.isna(b)) or str(b).strip() in ('', 'nan'))
+             for b in 칸값['B']]
+    A글 = ['' if (a is None or (isinstance(a, float) and pd.isna(a))) else str(a) for a in 칸값['A']]
+    유형들 = _줄유형(A글, B있음)
     줄들, 첫줄 = [], {c: True for c in 자동수식열}
     for i in range(len(새)):
         r = 시작행 + i
-        b = 칸값['B'][i]
-        그룹행 = (b is None or (isinstance(b, float) and pd.isna(b))
-                  or str(b).strip() in ('', 'nan'))
-        서식 = 그룹서식 if 그룹행 else 자료서식
+        유형 = 유형들[i]
         칸 = []
         for col in 전체열:
-            s = 서식.get(col) or 자료서식.get(col) or 그룹서식.get(col)
+            s = _칸서식(서식표, 유형, col)
+            if not s and col in 이어받기열:          # 비어 있던 열(검토 메모)은 옆 칸 서식을 빌립니다
+                s = _칸서식(서식표, 유형, 'X') or _칸서식(서식표, 유형, 'W')
             sa = f' s="{s}"' if s else ''
             if col in 원장열자리:
                 v = 칸값[col][i]
@@ -2455,7 +2584,7 @@ def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None):
                 elif col in 수식본:
                     원행, 본 = 수식본[col]
                     식 = f'<f>{_수식옮기기(본, 원행, r)}</f>'
-                    미리 = ({'Q': 미리Q, 'R': 미리R}.get(col) or [None] * len(새))[i]
+                    미리 = ({'W': 미리Q, 'X': 미리R}.get(col) or [None] * len(새))[i]
                     칸.append(_값칸(col, r, sa, 식, 미리)
                               if 미리 is not None
                               else f'<c r="{col}{r}"{sa}>{식}</c>')
@@ -2463,11 +2592,17 @@ def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None):
                     칸.append(f'<c r="{col}{r}"{sa}/>')
             else:
                 칸.append(f'<c r="{col}{r}"{sa}/>')
-        줄들.append(f'<row r="{r}" spans="1:22" ht="15" customHeight="1">'
+        줄들.append(f'<row r="{r}" spans="1:27">'
                     + ''.join(칸) + '</row>')
 
-    앞 = re.sub(r'<dimension ref="[^"]*"/>', f'<dimension ref="A1:V{끝행}"/>', 앞, count=1)
-    뒤 = re.sub(r'(<autoFilter ref="A5:)[A-Z]+\d+(")', rf'\g<1>T{끝행}\g<2>', 뒤, count=1)
+    앞 = re.sub(r'<dimension ref="[^"]*"/>', f'<dimension ref="A1:AA{끝행}"/>', 앞, count=1)
+    # 「계정」 머리글(5행) 아래 틀 고정 — 항상
+    앞 = re.sub(r'<sheetViews>.*?</sheetViews>',
+               '<sheetViews><sheetView showGridLines="0" zoomScaleNormal="100" workbookViewId="0">'
+               '<pane ySplit="5" topLeftCell="A6" activePane="bottomLeft" state="frozen"/>'
+               '<selection pane="bottomLeft" activeCell="A6" sqref="A6"/></sheetView></sheetViews>',
+               앞, count=1, flags=re.S)
+    뒤 = re.sub(r'(<autoFilter ref="A5:)[A-Z]+\d+(")', rf'\g<1>AA{끝행}\g<2>', 뒤, count=1)
     return 앞 + '<sheetData>' + ''.join(앞부분) + ''.join(줄들) + '</sheetData>' + 뒤
 
 
@@ -2874,7 +3009,7 @@ def _자금시트만들기(z, 시트칸, 공유, 새, 이어받음, 매핑표, �
     자금시트 = next((n for n in 시트칸 if '자금' in n), None)
     if not 자금시트:
         return None, None, None, {}
-    현금계정 = {k.strip().lower() for k, (b, kor) in 매핑표.items()
+    현금계정 = {k.strip().lower() for k, (b, kor, *_나머지) in 매핑표.items()
                 if b == 'BS' and ('현금' in kor or '예금' in kor)}
     한글 = {k.strip().lower(): v[1] for k, v in 매핑표.items()}
     비에스 = {k.strip().lower(): v[0] for k, v in 매핑표.items()}
@@ -2884,13 +3019,13 @@ def _자금시트만들기(z, 시트칸, 공유, 새, 이어받음, 매핑표, �
         '계정': _글자칸(새, 'Distribution account'),
         '전표': _글자칸(새, 'Transaction ID'),
         'Description': _글자칸(새, 'Description'),
-        '#': _글자칸(새, '#'),
+        '#': _글자칸(새, 'Num'),
         'Name': _글자칸(새, 'Name'),
         '일련': [_날짜일련(v) for v in 새['Transaction date']],
         '차변': pd.to_numeric(새.get('Debit'), errors='coerce').fillna(0).tolist(),
         '대변': pd.to_numeric(새.get('Credit'), errors='coerce').fillna(0).tolist(),
         '잔액': pd.to_numeric(새.get('Balance'), errors='coerce').fillna(0).tolist(),
-        '활동': [v or '' for v in 이어받음.get('Q', [None] * len(새))],
+        '활동': [v or '' for v in 이어받음.get('W', [None] * len(새))],
     })
     # 기초 현금 = 현금·예금 계정의 Beginning Balance 합계
     기초현금액 = float(g.loc[g['계정'].eq('Beginning Balance')
@@ -3232,6 +3367,16 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
     if 새 is None:
         raise ValueError('원장 파일에서 「Distribution account」 열을 찾지 못했습니다. '
                          'QuickBooks 에서 내려받은 General Ledger 원본이 맞는지 확인해 주세요.')
+    # 퀵북 「General Ledger List」 양식은 전표번호 열 이름이 「Num」 이 아니라 「#」 입니다.
+    새.columns = [str(c).strip() for c in 새.columns]
+    if 'Num' not in 새.columns and '#' in 새.columns:
+        새 = 새.rename(columns={'#': 'Num'})
+    # 미국 퀵북은 날짜를 「월/일/연도」 글자로 내보냅니다 → 열 전체를 보고 진짜 날짜로 바꿉니다
+    새['Transaction date'] = _날짜열맞추기(새['Transaction date'])
+    # 통째로 빈 줄과 맨 아래 「Accrual Basis …」 꼬리표 줄은 뺍니다 (남겨 두면 빈 줄에 괘선이 그어집니다)
+    첫열 = 새.columns[0]
+    꼬리 = 새[첫열].astype(str).str.strip().str.startswith('Accrual Basis')
+    새 = 새[~(새.isna().all(axis=1) | 꼬리)].reset_index(drop=True)
 
     # ── 2. 전월 실적보고자료
     z = zipfile.ZipFile(전bio)
@@ -3251,7 +3396,7 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
         옮김 = 새키.map(사전)
         이어받음[col] = [None if (v is None or (isinstance(v, float) and pd.isna(v))
                                  or str(v).strip() == '') else str(v) for v in 옮김]
-        if col == 'Q':
+        if col == 'W':
             이어받은수 = sum(1 for v in 이어받음[col] if v)
 
     # ── 3-2. 전월에 없던 새 거래는 지난달까지의 분류를 배워서 스스로 채웁니다
@@ -3261,8 +3406,7 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
     유효세부 = set(_시트글자(z, 시트칸[집계시트], 'E', 공유)) if 집계시트 else set()
     매핑시트 = next((n for n in 시트칸 if 'BS_IS_매핑' in n), None)
     매핑표 = _매핑표읽기(z, 시트칸[매핑시트], 공유) if 매핑시트 else {}
-    매핑분류 = {k: v[0] for k, v in 매핑표.items()}
-    분류센것 = _자동분류(새, 이어받음, _분류학습(전), 유효세부, 매핑분류)
+    분류센것 = _자동분류(새, 이어받음, _분류학습(전), 유효세부, 매핑표)
 
     날짜들 = [d for d in (_날짜일련(v) for v in 새['Transaction date']) if d is not None]
     처음 = 엑셀기준일 + datetime.timedelta(days=min(날짜들))
@@ -3271,14 +3415,18 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
     보고달 = 마지막.month
 
     # ── 4. 원장 시트를 갈아끼웁니다
-    새xml = _원장시트XML(z.read(올해파일).decode('utf-8'), 새, 이어받음, 기간글, 매핑표)
+    새xml = _원장시트XML(z.read(올해파일).decode('utf-8'), 새, 이어받음, 기간글, 매핑표, 공유)
     끝행 = 5 + len(새)
-    # 「당월 실적집계」는 이제 쓰지 않는 시트라 결과 파일에서 통째로 뺍니다.
-    #   (담당자가 원본에서 지우셨습니다. 옛 파일을 올리셔도 결과에는 들어가지 않습니다.)
+    # 「당월 실적집계」는 그대로 두고, 기준 월(H2)만 이번 달로 맞춥니다.
+    #   (OTC 실적자료는 시트 15개 구성을 그대로 유지합니다)
     당월시트 = next((n for n in 시트칸 if '당월' in n and '실적집계' in n), None)
     당월xml, 당월파일, 달바뀜, 수식고침 = None, None, False, []
-    뺀파트, 뺀패치 = (_시트빼기(z, 당월시트) if 당월시트 else (set(), {}))
-    뺀시트 = 당월시트 if 뺀파트 else None
+    뺀파트, 뺀패치, 뺀시트 = set(), {}, None
+    if 당월시트:
+        당월파일 = 시트칸[당월시트]
+        당월xml = z.read(당월파일).decode('utf-8')
+        당월xml, 달바뀜 = _칸값바꾸기(당월xml, 'H2', 보고달)
+        당월xml, 수식고침 = _당월수식고치기(당월xml)
 
     # ── 4-2. 「26년 자금」 시트도 이번 달까지로 다시 씁니다
     try:
@@ -3329,10 +3477,10 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
         시트목록 = [n for n in 시트목록 if n != 뺀시트]
     거래 = int(새['Distribution account'].notna().sum())
     자동합 = sum(분류센것.get(k, 0) for k in
-                 ('적요일치', '거래처일치', '계정과목대표값', '계정과목최빈값'))
+                 ('계정기준표', '적요일치', '거래처일치', '계정과목대표값', '계정과목최빈값'))
     안내 = {'연도': 연도, '월끝': 월끝, '기간': 기간글, '올해시트': 올해시트,
             '행수': len(새), '거래건수': 거래, '이어받음': 이어받은수,
-            '새거래': int(새키.isin(set(전키)).eq(False).sum()),
+            '새거래': int((~새키.isin(set(전키)) & 새['Distribution account'].notna()).sum()),
             '시트수': len(시트목록), '시트목록': 시트목록,
             '당월시트': 당월시트, '기준월맞춤': 달바뀜, '보고달': 보고달,
             '뺀시트': 뺀시트,
@@ -5292,7 +5440,8 @@ if 메뉴 == '실적보고 엑셀작성':
         <tr class="sub"><td class="name">새 거래를 스스로 나눈 것</td>
           <td class="lft">{안내['자동분류']:,}건
             <span style="color:{T['ink3']}">
-              (적요 {안내['분류내역'].get('적요일치', 0):,} ·
+              (계정 기준표 {안내['분류내역'].get('계정기준표', 0):,} ·
+               적요 {안내['분류내역'].get('적요일치', 0):,} ·
                거래처 {안내['분류내역'].get('거래처일치', 0):,} ·
                계정 {안내['분류내역'].get('계정과목대표값', 0):,} ·
                계정 최빈값 {안내['분류내역'].get('계정과목최빈값', 0):,})</span></td></tr>
@@ -5302,7 +5451,7 @@ if 메뉴 == '실적보고 엑셀작성':
             <span style="color:{T['ink3']}">
               (여러 갈래로 나뉘던 계정 {안내['분류내역'].get('확인필요', 0):,} ·
                처음 보는 계정 {안내['분류내역'].get('신규계정', 0):,})
-              — T열에서 「확인필요」로 걸러 보세요</span></td></tr>
+              — Y열에서 「확인필요」로 걸러 보세요</span></td></tr>
         <tr class="sub"><td class="name">전월 자료에 없던 새 거래</td>
           <td class="lft">{안내['새거래']:,}건</td></tr>
         <tr class="total"><td class="name">저장 위치</td>
@@ -5311,11 +5460,13 @@ if 메뉴 == '실적보고 엑셀작성':
     </table>
     <div style="margin-top:14px; padding-top:12px; border-top:1px solid {T['line']};
                 font-size:13px; line-height:1.85; color:{T['ink3']}">
+      원장 시트 A~P 는 퀵북 General Ledger 를 내려받은 그대로(Customer · Vendor 포함), Q~AA 가 클로드 집계열입니다<br>
       원장에서 저절로 계산되는 것 — 금액 · 년 · 월 · 계정분류 · 분류 · 계정과목 · 보고금액 · 월(숫자)
-      <b style="color:{T['ink2']}">(K~V열 수식 그대로)</b><br>
-      전월에서 이어받는 것 — 활동분류 · 활동세부 · 정부지원 · 검토메모<br>
-      새 거래는 지난달까지 나눠 두신 기준을 배워서 채우고, 그 근거를
-      <b style="color:{T['ink2']}">T열 「클로드 검토」</b> 에 적어 둡니다
+      <b style="color:{T['ink2']}">(Q~V · Z · AA열 수식)</b><br>
+      활동분류 · 활동세부(W·X) — BS_IS_매핑 시트의 E·F 열(계정별 기준)에서 수식으로 찾고,
+      전월 파일에서 손으로 고쳐 두신 줄은 그 값을 이어받습니다<br>
+      기준표에 없는 계정의 새 거래는 지난달까지 나눠 두신 기준을 배워서 채우고, 그 근거를
+      <b style="color:{T['ink2']}">Y열 「클로드 검토」</b> 에 적어 둡니다
       (「확인필요」가 붙은 줄부터 봐 주세요)
     </div>
   </div>
@@ -5323,7 +5474,7 @@ if 메뉴 == '실적보고 엑셀작성':
         경고 = []
         if 안내['확인필요']:
             경고.append(f"활동분류를 확실하게 정하지 못한 줄이 {안내['확인필요']:,}건 있습니다. "
-                        f"엑셀 「{안내['올해시트']}」 시트에서 T열을 「확인필요」로 걸러 보시면 "
+                        f"엑셀 「{안내['올해시트']}」 시트에서 Y열을 「확인필요」로 걸러 보시면 "
                         f"바로 찾으실 수 있습니다.")
         if 안내['집계밖']:
             경고.append(f"「월별 실적집계」에 없는 활동세부가 붙은 줄이 {안내['집계밖']:,}건 있습니다. "
