@@ -21,6 +21,7 @@ import calendar
 import datetime
 import urllib.request
 
+import openpyxl
 import pandas as pd
 import numpy as np
 import altair as alt
@@ -749,7 +750,10 @@ def _표준화(df, 매핑표, 연도힌트, 재분류=None):
             return '법인세'
         return '판관비'
 
-    df['분류'] = np.where(df['계정분류'].eq('IS'), df['계정과목'].map(_분류), None)
+    분류값 = df['계정과목'].map(_분류)
+    if 매핑표.get('cls'):
+        분류값 = k.map(매핑표['cls']).fillna(분류값)
+    df['분류'] = np.where(df['계정분류'].eq('IS'), 분류값, None)
 
     # 원장 양식에 따라 열 이름이 「활동분류」이기도 하고 「활동분류(대분류)」이기도 합니다.
     # ★둘 중 어느 쪽이 와도 같게 읽어야 합니다★ — 안 그러면 판관비가 전부 「기타관리경비」로 잡힙니다.
@@ -826,7 +830,14 @@ def _매핑표만들기(m):
     bsiscol = [c for c in m.columns if 'BS' in c][0]
     korcol = [c for c in m.columns if '한글' in c][0]
     key = m[영문col].astype(str).str.strip().str.lower()
-    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])),
+    # 「분류」 열(매출·매출원가·판관비·영업외손익·법인세)이 있으면 그 값을 계정 목록보다 우선합니다
+    #  (담당자가 급여·임차료 같은 계정을 제품매출원가로 옮길 때 이 열로 정합니다)
+    분류col = next((c for c in m.columns if str(c).strip() == '분류'), None)
+    cls = {}
+    if 분류col is not None:
+        cls = {k: str(v).strip() for k, v in zip(key, m[분류col])
+               if isinstance(v, str) and str(v).strip() in ('매출', '매출원가', '판관비', '영업외손익', '법인세')}
+    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])), 'cls': cls,
             'table': m.rename(columns={영문col: '계정(영문)', bsiscol: 'BS/IS',
                                        korcol: '계정과목(한글)'})}
 
@@ -2339,12 +2350,12 @@ def _시트칸읽기(z, 파일, 열들, 공유):
 
 
 def _매핑표읽기(z, 파일, 공유):
-    """BS_IS_매핑 시트에서 「계정 이름 → (BS/IS, 한글 계정과목, 활동분류, 활동세부)」를 읽습니다.
+    """BS_IS_매핑 시트에서 「계정 이름 → (BS/IS, 한글 계정과목, 활동분류, 활동세부, 분류)」를 읽습니다.
 
     ※ E·F 열(활동분류·활동세부)은 OTC 실적자료에만 있습니다. 없으면 빈 글자로 둡니다.
     """
     지도 = {}
-    for 행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C', 'E', 'F'), 공유).items():
+    for 행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C', 'E', 'F', 'G'), 공유).items():
         if 행 == 1:
             continue
         이름 = str(칸.get('A', '')).strip()
@@ -2352,7 +2363,8 @@ def _매핑표읽기(z, 파일, 공유):
             지도[이름] = (str(칸.get('B', '')).strip().upper(),
                           str(칸.get('C', '')).strip(),
                           str(칸.get('E', '')).strip(),
-                          str(칸.get('F', '')).strip())
+                          str(칸.get('F', '')).strip(),
+                          str(칸.get('G', '')).strip())      # 분류 (있을 때만)
     return 지도
 
 
@@ -2485,7 +2497,7 @@ def _분류수식(칸):
     'R': (6, 'IF(C6="","",YEAR(C6)&"년")'),
     'S': (6, 'IF(C6="","",MONTH(C6)&"월")'),
     'T': (6, 'IFERROR(INDEX(BS_IS_매핑!$B:$B,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
-    'U': (6, _분류수식('V6')),
+    'U': (6, _분류수식('V6')),          # 매핑표에 「분류」 열이 있으면 아래 _원장시트XML 에서 G열 참조로 바꿉니다
     'V': (6, 'IFERROR(INDEX(BS_IS_매핑!$C:$C,MATCH(B6,BS_IS_매핑!$A:$A,0)),"")'),
     'W': (6, 'IF(C6="","",IFERROR(INDEX(BS_IS_매핑!$E:$E,MATCH(B6,BS_IS_매핑!$A:$A,0))&"",""))'),
     'X': (6, 'IF(C6="","",IFERROR(INDEX(BS_IS_매핑!$F:$F,MATCH(B6,BS_IS_매핑!$A:$A,0))&"",""))'),
@@ -2511,13 +2523,13 @@ def _수식값미리계산(새, 이어받음, 매핑표, 날짜):
         비었다 = d is None
         날 = None if 비었다 else 엑셀기준일 + datetime.timedelta(days=d)
         b = 계정[i]
-        bs, kor, 활동, 세부 = (tuple(매핑표.get(b, ())) + ('', '', '', ''))[:4]
+        bs, kor, 활동, 세부, 분류표 = (tuple(매핑표.get(b, ())) + ('', '', '', '', ''))[:5]
         분류 = ''
         if bs == 'IS':
-            분류 = ('매출' if kor in 매출계정
-                    else '매출원가' if kor in 매출원가계정
-                    else '영업외손익' if kor in 영업외계정
-                    else '법인세' if kor in 법인세계정 else '판관비')
+            분류 = 분류표 or ('매출' if kor in 매출계정
+                             else '매출원가' if kor in 매출원가계정
+                             else '영업외손익' if kor in 영업외계정
+                             else '법인세' if kor in 법인세계정 else '판관비')
         값['Q'].append('' if 비었다 else 대변[i] - 차변[i])
         값['R'].append('' if 비었다 else f'{날.year}년')
         값['S'].append('' if 비었다 else f'{날.month}월')
@@ -2555,7 +2567,10 @@ def _원장시트XML(원본xml, 새, 이어받음, 기간글, 매핑표=None, �
                 날짜칸서식[t] = 기본C
     # 전월 파일에서 수식이 지워진 칸은 본디 수식으로 되살립니다
     되살림 = [c for c in 기본수식본 if c not in 수식본]
-    수식본 = {**{c: (기본수식본[c][0], _xml(기본수식본[c][1])) for c in 되살림}, **수식본}
+    기본 = dict(기본수식본)
+    if 매핑표 and any(len(v) > 4 and v[4] for v in 매핑표.values()):     # BS_IS_매핑 G열 「분류」
+        기본['U'] = (6, 'IF(T6<>"IS","",IFERROR(INDEX(BS_IS_매핑!$G:$G,MATCH(B6,BS_IS_매핑!$A:$A,0))&"",""))')
+    수식본 = {**{c: (기본[c][0], _xml(기본[c][1])) for c in 되살림}, **수식본}
     _되살린열.clear()
     _되살린열.extend(sorted(되살림))
 
@@ -4535,6 +4550,99 @@ def 연결패키지캐시(원장바이트, 양식바이트):
 
 양식보관 = 기억자리('최근패키지양식.xlsx')    # 본사에서 받은 연결패키지 원본
 매입보관 = 기억자리('최근매입내역.xlsx')      # 재고 매입내역 (원재료·부자재 입고 + 단가표)
+출고보관 = 기억자리('최근출고내역.xlsx')      # 출고(판매) 내역 — Sales by Customer Detail 정리본
+기초수불보관 = 기억자리('최근기초수불.xlsx')  # 재무제표 파일 (「수불부」 시트 — 기초재고 · 제품 입출고)
+
+
+# ── 원가관리 화면이 함께 쓰는 자료 읽기 ───────────────────────────────
+@st.cache_data(show_spinner=False)
+def 출고내역읽기(바이트):
+    """출고(판매) 내역 — 퀵북 「Sales by Customer Detail」 을 담당자가 제품코드로 정리한 파일.
+    → DataFrame(거래처, PO, 거래일, 유형, 청구서, 제품코드, 제품명, 수량, 금액)"""
+    xls = pd.ExcelFile(io.BytesIO(바이트))
+    시트 = next((s for s in xls.sheet_names if 'raw' in str(s).lower() and 'sales' in str(s).lower()), None)
+    if 시트 is None:
+        시트 = next((s for s in xls.sheet_names if 'Customer' in str(s) or '출고' in str(s)), xls.sheet_names[0])
+    d = pd.read_excel(xls, sheet_name=시트)
+    d.columns = [str(c).strip() for c in d.columns]
+    def 열(*후보):
+        return next((c for c in d.columns if c.lower() in [h.lower() for h in 후보]), None)
+    c고객, c날짜, c유형, c번호 = 열('Customer', '거래처'), 열('Transaction date', '거래일'), 열('Transaction type'), 열('Num', '#', '청구서')
+    c코드, c이름, c수량, c금액 = 열('제품코드', 'Product code'), 열('제품명', 'Product/Service full name'), 열('Quantity', '수량'), 열('Amount', '금액')
+    if c금액 is None or c수량 is None:
+        raise ValueError('출고 내역에서 Quantity · Amount 열을 찾지 못했습니다.')
+    out = pd.DataFrame({
+        '거래처': d[c고객].fillna('').astype(str).str.strip() if c고객 else '',
+        'PO': d[열('PO')].fillna('').astype(str).str.strip() if 열('PO') else '',
+        '거래일': _날짜열맞추기(d[c날짜]) if c날짜 else pd.NaT,
+        '유형': d[c유형].fillna('').astype(str).str.strip() if c유형 else '',
+        '청구서': d[c번호].fillna('').astype(str).str.strip() if c번호 else '',
+        '제품코드': d[c코드].fillna('').astype(str).str.strip() if c코드 else '',
+        '제품명': d[c이름].fillna('').astype(str).str.strip() if c이름 else '',
+        '수량': pd.to_numeric(d[c수량], errors='coerce').fillna(0.0),
+        '금액': pd.to_numeric(d[c금액], errors='coerce').fillna(0.0)})
+    # 맨 아래 합계 줄(날짜 없음)과 통째로 빈 줄은 뺍니다
+    out = out[out['거래일'].notna()].reset_index(drop=True)
+    out['월'] = out['거래일'].dt.month
+    out['거래처(상위)'] = out['거래처'].str.split(':').str[0].str.strip()
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def 기초수불읽기(바이트):
+    """담당자 재고수불부 파일(「수불부」 시트) → (원부자재 표, 제품 표).
+    원부자재 표 : 코드 · 품명 · 구분(원재료/부자재/기타) · 기초수량 · 기초금액
+    제품 표     : 코드 · 품명 · 구분(Product/Bulk) · 기초/입고/출고/기말 수량·금액 · 매출액"""
+    wb = openpyxl.load_workbook(io.BytesIO(바이트), read_only=True, data_only=True)
+    이름 = next((s for s in wb.sheetnames if '수불' in s), None)
+    if 이름 is None:
+        raise ValueError('「수불부」 시트를 찾지 못했습니다.')
+    ws = wb[이름]
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+    # 머리글 줄 : 「구분」 이 있는 줄
+    머리 = next((i for i, r in enumerate(rows) if any(str(v).strip() == '구분' for v in r if v is not None)), None)
+    if 머리 is None:
+        raise ValueError('「수불부」 시트에서 머리글(구분 · 신코드 · 품명 …)을 찾지 못했습니다.')
+    머리행 = [str(v).strip() if v is not None else '' for v in rows[머리]]
+    def 찾기(단어):
+        return next((j for j, h in enumerate(머리행) if h.replace(' ', '').startswith(단어)), None)
+    c구분, c코드, c품명 = 찾기('구분'), 찾기('신코드'), 찾기('품')
+    if c구분 is None or c코드 is None:
+        raise ValueError('「수불부」 머리글에서 구분 · 신코드 열을 찾지 못했습니다.')
+    # 기초·입고·출고·기말 은 수량·금액 짝으로 순서대로 (기초수량 = 코드 열 다음 다음)
+    수량열 = [j for j, h in enumerate(머리행) if h.replace(' ', '') == '수량']
+    금액열 = [j for j, h in enumerate(머리행) if h.replace(' ', '') == '금액']
+    c매출 = 찾기('매출액')
+    if c매출 is None:                       # 「매출액」 표시가 제품 구간 소제목 줄에 있는 양식
+        c매출 = next((j for r in rows for j, v in enumerate(r) if v is not None and str(v).strip() == '매출액'), None)
+    def n(v):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    원부, 제품, 구간 = [], [], '원부자재'
+    for r in rows[머리 + 1:]:
+        r = list(r) + [None] * (30 - len(r))
+        구분 = str(r[c구분]).strip() if r[c구분] is not None else ''
+        코드 = str(r[c코드]).strip() if r[c코드] is not None else ''
+        if not 코드:
+            # 코드 없는 줄 = 합계 줄 → 원부자재 구간이 끝나고 제품 구간으로
+            if 구분 and 구간 == '원부자재' and any(r[j] is not None for j in 수량열[:1]):
+                구간 = '제품'
+            continue
+        if 코드.lower() == 'nan':
+            continue
+        기초수, 기초금 = n(r[수량열[0]]), n(r[금액열[0]])
+        if 구간 == '원부자재':
+            종류 = '원재료' if 코드.upper().startswith('R') else ('부자재' if 코드.upper().startswith('P') else '기타')
+            원부.append({'코드': 코드, '품명': str(r[c품명] or '').strip(), '구분': 종류, '기초수량': 기초수, '기초금액': 기초금})
+        else:
+            제품.append({'코드': 코드, '품명': str(r[c품명] or '').strip(), '구분': 구분,
+                       '기초수량': 기초수, '기초금액': 기초금,
+                       '입고수량': n(r[수량열[1]]), '입고금액': n(r[금액열[1]]),
+                       '출고수량': n(r[수량열[2]]), '출고금액': n(r[금액열[2]]),
+                       '기말수량': n(r[수량열[3]]), '기말금액': n(r[금액열[3]]),
+                       '매출액': n(r[c매출]) if c매출 is not None else 0.0})
+    return pd.DataFrame(원부), pd.DataFrame(제품)
+
+
 패키지보관 = 기억자리('최근패키지.xlsx')      # 마지막으로 만든 연결패키지 재무제표
 
 
@@ -4783,7 +4891,7 @@ st.sidebar.markdown("""
 # 「실적보고」를 누르면 아래 세 화면이 펼쳐집니다 (맨 처음은 누적 실적보고)
 실적하위 = ['누적 실적보고', '당월 실적보고', '월별 실적보고']
 # 「원가관리」 아래 화면 — 매입관리(재고 매입내역 vs 퀵북 원장 매입) · 재고수불부
-원가하위 = ['매입관리', '재고수불부']
+원가하위 = ['매입관리', '매출관리', '재고수불부']
 # 「연결재무제표 패키지」도 같은 방식으로 네 화면을 거느립니다
 패키지하위 = ['재무제표', '주석사항']
 # 재무제표 화면 안에서 고르는 세 가지 (자동 번역을 막으려고 영문 약칭을 앞에 답니다)
@@ -5208,10 +5316,15 @@ def 자료종류(바이트):
         return '원장'
     if any('매입' in s and ('원재료' in s or '부자재' in s) for s in 시트):
         return '매입'                       # 재고 매입내역 (매입관리·재고수불부 화면)
+    if any('raw' in s.lower() and 'sales' in s.lower() for s in 시트):
+        return '출고'                       # 출고(판매) 내역 (매출관리 화면)
+    if any(s.strip() == '수불부' for s in 시트):
+        return '기초수불'                   # 재무제표 파일 — 기초재고 · 제품 입출고
     return ''
 
 
-종류이름 = {'실적': '실적 엑셀', '원장': '원장 원본', '양식': '연결패키지 양식', '매입': '재고 매입내역'}
+종류이름 = {'실적': '실적 엑셀', '원장': '원장 원본', '양식': '연결패키지 양식', '매입': '재고 매입내역',
+            '출고': '출고 내역', '기초수불': '재무제표(수불부 시트)'}
 
 
 def 자료받기(파일들):
@@ -5229,6 +5342,10 @@ def 자료받기(파일들):
             _자리에쓰기(양식보관, 바이트, f.name)
         elif 종 == '매입':
             _자리에쓰기(매입보관, 바이트, f.name)
+        elif 종 == '출고':
+            _자리에쓰기(출고보관, 바이트, f.name)
+        elif 종 == '기초수불':
+            _자리에쓰기(기초수불보관, 바이트, f.name)
         목록.append((f.name, 종))
     return 실적, 목록
 
@@ -6288,22 +6405,28 @@ if 메뉴 == '누적 실적보고':
         '용역': 접두합('services'),
     }
     # 직접원가 — 제품은 제조원가 계정, 상품은 퀵북 기본 매출원가 계정
-    공헌직접 = {'제품': -접두합('5100', '5300', '5400', '5800', '5830', '5840',
-                              '5850', '5860', 'cogs_1300'),
-                '상품': -접두합('cost of goods sold', 'inventory shrinkage')}
     IS전 = 당해원장[당해원장['계정분류'].eq('IS')]
+    상품원가 = -접두합('cost of goods sold', 'inventory shrinkage')
+    # 제품 직접원가 = 분류가 「매출원가」인 것 전부(상품원가 제외) — 담당자가 제품매출원가로 옮긴
+    #  급여·임차료·전력비 등도 여기 들어갑니다 (BS_IS_매핑 「분류」 열 기준)
+    매출원가총 = -float(IS전.loc[IS전['분류'].eq('매출원가'), '금액'].sum())
+    공헌직접 = {'제품': 매출원가총 - 상품원가, '상품': 상품원가}
+    판관행 = IS전[IS전['분류'].eq('판관비')]
 
     def 과목합(*과목들):
         return -float(IS전.loc[IS전['계정과목'].isin(과목들), '금액'].sum())
 
+    def 판관과목합(*과목들):
+        return -float(판관행.loc[판관행['계정과목'].isin(과목들), '금액'].sum())
+
     감가전 = 과목합('감가상각비', '무형자산상각비')
     임차전 = 과목합('지급임차료')
-    급여전 = 과목합('급여')
-    복리전 = 과목합('복리후생비')
-    # 부분직접비 — 매출 규모에 따라 나눠 지는 고정성 비용(임차·상각)
-    부분직접총 = 감가전 + 임차전
-    판관비총 = -float(IS전.loc[IS전['분류'].eq('판관비'), '금액'].sum())
-    공통비총 = 판관비총 - 감가전 - 임차전
+    급여전 = 판관과목합('급여')
+    복리전 = 판관과목합('복리후생비')
+    # 부분직접비 — 판관비에 남아 있는 고정성 비용(임차·상각)만. 제품매출원가로 옮긴 몫은 이미 직접원가입니다
+    부분직접총 = 판관과목합('감가상각비', '무형자산상각비') + 판관과목합('지급임차료')
+    판관비총 = -float(판관행['금액'].sum())
+    공통비총 = 판관비총 - 부분직접총
     공헌기준 = {c: 공헌매출[c] - 공헌직접.get(c, 0.0) for c in 공헌매출}
     기준합 = sum(공헌기준.values())
     공헌매출합 = sum(공헌매출.values())
@@ -6379,10 +6502,11 @@ if 메뉴 == '누적 실적보고':
         <details class="calcnote"{로컬열림}>
           <summary>직접원가 · 부분직접비 · 공통비 구성 <span class="hint">원장 계정 합계 · 누르면 펼쳐집니다</span></summary>
           <div class="body">
-          <b>직접원가 {CK(sum(직접값))}</b> — 제조원가(5100 원재료 · 5300 매입운임 · 5400 직접노무 ·
-          5800대 시험·실험소모품·포장재) {CK(-접두합('5100', '5300', '5400', '5800', '5830', '5840', '5850', '5860'))} ·
-          상품원가(Cost of Goods Sold) {CK(-접두합('cost of goods sold'))}<br>
-          <b>부분직접비 {CK(부분직접총)}</b> — 감가상각비 {CK(감가전)} · 지급임차료(7900 · 7200) {CK(임차전)}<br>
+          <b>직접원가 {CK(sum(직접값))}</b> — 제품매출원가(분류 「매출원가」 전체 : 원재료·매입운임·직접노무·시험분석·
+          급여·임차료·전력비 등 제조로 옮긴 항목 포함) {CK(매출원가총 - 상품원가)} ·
+          상품원가(Cost of Goods Sold) {CK(상품원가)}<br>
+          <b>부분직접비 {CK(부분직접총)}</b> — 판관비에 남은 감가상각비·임차료
+          (감가상각비 전체 {CK(감가전)} · 지급임차료 전체 {CK(임차전)} 는 제품매출원가에 들어 있습니다)<br>
           <b>공통비 {CK(공통비총)}</b> — 인건비(6000 급여) {CK(급여전)} ·
           복리후생 · 급여세 {CK(복리전)} · 그 밖의 판관비(지급수수료 · 보험료 · 전력비 · 건물관리비 등)
           {CK(공통비총 - 급여전 - 복리전)}</div></details>
@@ -7120,7 +7244,7 @@ elif 메뉴 in ('매입관리', '재고수불부'):
 
     # ── 원장 쪽: 재고(원재료) 계정으로 들어온 매입 + 손익의 원재료·부자재·포장재 매입
     재고계정 = 당해원장['계정과목'].eq('원재료') & 당해원장['계정분류'].eq('BS')
-    손익매입 = 당해원장['활동세부'].isin(['원재료 매입', '부자재 매입', '포장재'])
+    손익매입 = 당해원장['활동세부'].isin(['원재료 직접출고원가', '부자재 직접출고원가', '원재료 매입', '부자재 매입', '포장재'])
     원장매입 = 당해원장[(재고계정 | 손익매입) & 당해원장['월'].le(보고월)].copy()
     거래유형 = 원장매입.get('Transaction type', pd.Series('', index=원장매입.index)).fillna('').astype(str)
     # 재고 계정의 「Inventory Starting Value · Invoice · Journal Entry · Inventory Adjust」 는 매입이 아니라 재고 조정입니다
@@ -7131,46 +7255,115 @@ elif 메뉴 in ('매입관리', '재고수불부'):
     원장매입['거래처'] = 벤더열.fillna(원장매입.get('Name')).fillna('(거래처 없음)').astype(str).str.strip()
 
     # ── 원재료·부자재를 따로 견줄 때의 원장 쪽 몫
-    원장원재료 = 원장매입[원장매입['계정과목'].eq('원재료') | 원장매입['활동세부'].eq('원재료 매입')]
-    원장부자재 = 원장매입[원장매입['활동세부'].isin(['부자재 매입', '포장재'])]
+    원장원재료 = 원장매입[원장매입['계정과목'].eq('원재료') | 원장매입['활동세부'].isin(['원재료 직접출고원가', '원재료 매입'])]
+    원장부자재 = 원장매입[원장매입['활동세부'].isin(['부자재 직접출고원가', '부자재 매입', '포장재'])]
 
 if 메뉴 == '재고수불부':
+    # ── 기초재고(담당자 수불부 파일) · 출고 내역 파일 — 있으면 씁니다
+    기초있음, 기초이름, _크기, 기초때 = 보관자료(기초수불보관)
+    출고있음, 출고이름, _크기2, 출고때 = 보관자료(출고보관)
+    with st.expander('기초재고 · 출고 내역 파일', expanded=not (기초있음 and 출고있음)):
+        st.caption('① 재무제표 파일의 「수불부」 시트에서 원재료·부자재·제품의 기초재고를, 제품 줄(원부자재 합계 아래)에서 제품 입고·출고를 읽습니다. '
+                   '② 출고 내역(raw (sales)) 파일로 제품 출고수량을 대조합니다. 왼쪽 「설정 · 파일 업로드」 에 같이 올리셔도 됩니다.')
+        올린기초 = st.file_uploader('기초재고 (재무제표 · 수불부 시트가 든 .xlsx)', type=['xlsx'], key='기초업로드')
+        if 올린기초 is not None:
+            자료남기기(기초수불보관, 올린기초)
+            기초있음, 기초이름, _크기, 기초때 = 보관자료(기초수불보관)
+        올린출고2 = st.file_uploader('출고 내역 (.xlsx)', type=['xlsx'], key='출고업로드2')
+        if 올린출고2 is not None:
+            자료남기기(출고보관, 올린출고2)
+            출고있음, 출고이름, _크기2, 출고때 = 보관자료(출고보관)
+        if 기초있음:
+            st.caption(f'기초재고 파일: {기초이름} ({datetime.datetime.fromtimestamp(기초때):%Y-%m-%d %H:%M} 올림)')
+        if 출고있음:
+            st.caption(f'출고 내역 파일: {출고이름} ({datetime.datetime.fromtimestamp(출고때):%Y-%m-%d %H:%M} 올림)')
+    원부기초, 제품기초 = pd.DataFrame(), pd.DataFrame()
+    if 기초있음:
+        try:
+            원부기초, 제품기초 = 기초수불읽기(보관바이트(기초수불보관))
+        except Exception as e:
+            st.warning(f'기초재고 파일을 읽지 못했습니다: {e}')
+    출고 = pd.DataFrame()
+    if 출고있음:
+        try:
+            출고 = 출고내역읽기(보관바이트(출고보관))
+            출고 = 출고[출고['거래일'].dt.year.eq(당해연도) & 출고['월'].le(보고월)]
+        except Exception as e:
+            st.warning(f'출고 내역을 읽지 못했습니다: {e}')
+    기초사전 = {}
+    if len(원부기초):
+        기초사전 = {r['코드']: (float(r['기초수량']), float(r['기초금액'])) for _i, r in 원부기초.iterrows()}
+
     def 수불부(구분, 조정액):
-        """품목별 수불부 표 → DataFrame. 입고 = 매입내역(Purchase), 조정액이 있으면 맨 아래 「재고조정」 줄을 붙입니다."""
+        """원부자재 수불부 → DataFrame. 기초 = 담당자 수불부 파일, 입고 = 매입내역(Purchase),
+        조정액이 있으면 맨 아래 「재고조정」 줄을 붙입니다. 매입내역에 없고 기초만 있는 품목도 줄을 만듭니다."""
         d = 산것[산것['구분'].eq(구분)]
         g = (d.groupby(['코드', '자재명']).agg(입고수량=('입고량', 'sum'), 입고금액=('금액', 'sum'))
              .reset_index().sort_values('입고금액', ascending=False))
-        표 = pd.DataFrame({'품목코드': g['코드'], '품목명': g['자재명'],
-                          '기초수량': 0.0, '기초금액': 0.0,
-                          '입고수량': g['입고수량'].astype(float), '입고금액': g['입고금액'].astype(float),
-                          '출고수량': 0.0, '출고금액': 0.0, '조정수량': 0.0, '조정금액': 0.0})
+        줄 = [{'품목코드': r['코드'], '품목명': r['자재명'], '입고수량': float(r['입고수량']), '입고금액': float(r['입고금액'])}
+             for _i, r in g.iterrows()]
+        있는코드 = {x['품목코드'] for x in 줄}
+        if len(원부기초):
+            for _i, r in 원부기초[원부기초['구분'].eq(구분)].iterrows():
+                if r['코드'] not in 있는코드 and (r['기초수량'] or r['기초금액']):
+                    줄.append({'품목코드': r['코드'], '품목명': r['품명'], '입고수량': 0.0, '입고금액': 0.0})
+        표 = pd.DataFrame(줄, columns=['품목코드', '품목명', '입고수량', '입고금액'])
+        표['기초수량'] = 표['품목코드'].map(lambda k: 기초사전.get(k, (0.0, 0.0))[0])
+        표['기초금액'] = 표['품목코드'].map(lambda k: 기초사전.get(k, (0.0, 0.0))[1])
+        표['출고수량'] = 0.0; 표['출고금액'] = 0.0; 표['조정수량'] = 0.0; 표['조정금액'] = 0.0
         if 조정액 is not None:
             표 = pd.concat([표, pd.DataFrame([{'품목코드': '', '품목명': '재고조정 (원장 매입금액과의 차이)',
                                               '기초수량': 0.0, '기초금액': 0.0, '입고수량': np.nan, '입고금액': 조정액,
                                               '출고수량': 0.0, '출고금액': 0.0, '조정수량': 0.0, '조정금액': 0.0}])],
                            ignore_index=True)
+        표 = 표[['품목코드', '품목명', '기초수량', '기초금액', '입고수량', '입고금액', '출고수량', '출고금액', '조정수량', '조정금액']]
         표['기말수량'] = 표['기초수량'] + 표['입고수량'].fillna(0) - 표['출고수량'] + 표['조정수량']
         표['기말재고'] = 표['기초금액'] + 표['입고금액'] - 표['출고금액'] + 표['조정금액']
         return 표
 
-    def 수불부표(제목, 표, 설명):
+    def 제품수불부():
+        """제품 수불부 — 기초·입고는 담당자 수불부 파일, 출고수량은 출고 내역(매출자료)로 대조합니다."""
+        if not len(제품기초):
+            return pd.DataFrame(), pd.DataFrame()
+        p = 제품기초.copy()
+        판매 = (출고.groupby('제품코드').agg(판매수량=('수량', 'sum'), 판매금액=('금액', 'sum'))
+                if len(출고) else pd.DataFrame(columns=['판매수량', '판매금액']))
+        p = p.merge(판매, left_on='코드', right_index=True, how='outer')
+        p['품명'] = p['품명'].fillna(p['코드'].map(출고.groupby('제품코드')['제품명'].first().to_dict() if len(출고) else {})).fillna('')
+        for c in ('기초수량', '기초금액', '입고수량', '입고금액', '출고수량', '출고금액', '기말수량', '기말금액', '매출액', '판매수량', '판매금액'):
+            p[c] = pd.to_numeric(p.get(c), errors='coerce').fillna(0.0)
+        표 = pd.DataFrame({'품목코드': p['코드'], '품목명': p['품명'],
+                          '기초수량': p['기초수량'], '기초금액': p['기초금액'],
+                          '입고수량': p['입고수량'], '입고금액': p['입고금액'],
+                          '출고수량': p['출고수량'], '출고금액': p['출고금액'],
+                          '조정수량': 0.0, '조정금액': 0.0})
+        표['기말수량'] = 표['기초수량'] + 표['입고수량'] - 표['출고수량'] + 표['조정수량']
+        표['기말재고'] = 표['기초금액'] + 표['입고금액'] - 표['출고금액'] + 표['조정금액']
+        검증 = pd.DataFrame({'품목코드': p['코드'], '품목명': p['품명'], '수불 출고수량': p['출고수량'],
+                            '매출자료 수량': p['판매수량'], '수량 차이': p['출고수량'] - p['판매수량'],
+                            '기초+입고': p['기초수량'] + p['입고수량'], '판매수량': p['판매수량'],
+                            '부족수량': (p['판매수량'] - p['기초수량'] - p['입고수량']).clip(lower=0),
+                            '매출액(수불)': p['매출액'], '매출액(출고내역)': p['판매금액']})
+        return 표.sort_values('출고수량', ascending=False).reset_index(drop=True), 검증
+
+    def 수불부표(제목, 표, 설명, 키):
         수량 = lambda v: '' if (v is None or pd.isna(v)) else (f'{v:,.2f}'.rstrip('0').rstrip('.') if abs(v) % 1 else f'{v:,.0f}')
         줄들 = ''
         for _i, r in 표.iterrows():
             조정줄 = r['품목코드'] == '' and '재고조정' in str(r['품목명'])
             꼴 = f' style="color:{ROSE}"' if 조정줄 else ''
+            음수 = f' style="color:{ROSE};font-weight:700"' if float(r['기말수량']) < -0.001 else ''
             줄들 += (f'<tr class="sub"><td class="lft">{r["품목코드"]}</td><td class="lft"{꼴}>{r["품목명"]}</td>'
                      f'<td>{수량(r["기초수량"])}</td><td>{금액(r["기초금액"])}</td>'
                      f'<td>{수량(r["입고수량"])}</td><td{꼴}>{금액(r["입고금액"])}</td>'
                      f'<td>{수량(r["출고수량"])}</td><td>{금액(r["출고금액"])}</td>'
                      f'<td>{수량(r["조정수량"])}</td><td>{금액(r["조정금액"])}</td>'
-                     f'<td>{수량(r["기말수량"])}</td><td><b>{금액(r["기말재고"])}</b></td></tr>')
+                     f'<td{음수}>{수량(r["기말수량"])}</td><td><b>{금액(r["기말재고"])}</b></td></tr>')
         합 = {c: float(표[c].sum()) for c in ('기초수량', '기초금액', '입고수량', '입고금액', '출고수량', '출고금액',
                                               '조정수량', '조정금액', '기말수량', '기말재고')}
         st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
           <div class="card"><h3>{제목} <span class="unitbadge">단위 USD</span></h3>
-            <div class="sub">{당해연도}년 1~{보고월}월 · 입고 = 재고 매입내역(발주유형 Purchase · 입고량 × 단가표 단가) · {설명} ·
-              기초·출고·조정은 자료를 받으면 채웁니다 (지금은 0)</div>
+            <div class="sub">{당해연도}년 1~{보고월}월 · {설명}</div>
             <div class="stick" style="max-height:620px; overflow:auto"><table class="lined" style="min-width:1240px; margin-top:8px">
               <colgroup><col style="width:9%"><col style="width:23%">{'<col style="width:6.8%">' * 10}</colgroup>
               <thead><tr><th>품목코드</th><th>품목명</th><th>기초수량</th><th>기초금액</th><th>입고수량</th><th>입고금액</th>
@@ -7191,36 +7384,70 @@ if 메뉴 == '재고수불부':
     조정액 = 원장합계 - 매입내역합계
     원재료표 = 수불부('원재료', 조정액)
     부자재표 = 수불부('부자재', None)
+    제품표, 제품검증 = 제품수불부()
     원재료입고 = float(산것.loc[산것['구분'].eq('원재료'), '금액'].sum())
     부자재입고 = 매입내역합계 - 원재료입고
-    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="kpi-row" style="--n:5">
+    기초합 = {'원재료': float(원재료표['기초금액'].sum()), '부자재': float(부자재표['기초금액'].sum()),
+             '제품': float(제품표['기초금액'].sum()) if len(제품표) else 0.0}
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="kpi-row" style="--n:6">
+      <div class="kpi-card"><div class="kpi-label">기초재고 (원재료 · 부자재 · 제품)</div>
+        <div class="kpi-value" style="font-size:20px;font-weight:700">{금액(sum(기초합.values()))} <span class="unit">USD</span></div>
+        <div class="unit">{금액(기초합['원재료'])} · {금액(기초합['부자재'])} · {금액(기초합['제품'])}</div></div>
       <div class="kpi-card"><div class="kpi-label">원재료 입고 (매입내역)</div>
-        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원재료입고)} <span class="unit">USD</span></div></div>
+        <div class="kpi-value" style="font-size:22px;font-weight:700">{금액(원재료입고)} <span class="unit">USD</span></div></div>
       <div class="kpi-card"><div class="kpi-label">부자재 입고 (매입내역)</div>
-        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(부자재입고)} <span class="unit">USD</span></div></div>
-      <div class="kpi-card"><div class="kpi-label">매입내역 합계</div>
-        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(매입내역합계)} <span class="unit">USD</span></div></div>
+        <div class="kpi-value" style="font-size:22px;font-weight:700">{금액(부자재입고)} <span class="unit">USD</span></div></div>
       <div class="kpi-card"><div class="kpi-label">재고조정 (원장 − 매입내역)</div>
-        <div class="kpi-value {'warn' if abs(조정액) > 1 else 'ok'}" style="font-size:24px;font-weight:700">{금액(조정액)} <span class="unit">USD</span></div></div>
-      <div class="kpi-card"><div class="kpi-label">퀵북 원장 매입 = 수불부 입고금액 합계</div>
-        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원장합계)} <span class="unit">USD</span></div></div>
+        <div class="kpi-value {'warn' if abs(조정액) > 1 else 'ok'}" style="font-size:22px;font-weight:700">{금액(조정액)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">퀵북 원장 매입 = 원부자재 입고 합계</div>
+        <div class="kpi-value" style="font-size:22px;font-weight:700">{금액(원장합계)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">제품 출고 (수불 · 매출자료)</div>
+        <div class="kpi-value" style="font-size:22px;font-weight:700">{(float(제품표['출고수량'].sum()) if len(제품표) else 0):,.0f} <span class="unit">개</span></div>
+        <div class="unit">매출자료 {(float(출고['수량'].sum()) if len(출고) else 0):,.0f}개</div></div>
     </div></div>""")
     수불부표('원재료 수불부', 원재료표,
-           f'맨 아래 「재고조정」 {금액(조정액)} 은 퀵북 원장 매입금액 {금액(원장합계)} 과 매입내역(원재료+부자재) {금액(매입내역합계)} 의 차이 — '
-           f'이 줄을 더하면 두 수불부의 입고금액 합계가 원장과 같습니다')
-    수불부표('부자재 수불부', 부자재표, '재고조정은 원재료 수불부 한 줄로 맞춥니다 (퀵북 재고 계정은 원재료·부자재를 나누지 않습니다)')
+           f'기초 = 재무제표 수불부 파일 · 입고 = 재고 매입내역(Purchase · 입고량 × 단가) · 맨 아래 「재고조정」 {금액(조정액)} 은 퀵북 원장 매입금액 '
+           f'{금액(원장합계)} 과 매입내역(원재료+부자재) {금액(매입내역합계)} 의 차이 — 이 줄을 더하면 두 수불부의 입고금액 합계가 원장과 같습니다 · 출고·조정은 자료 대기', '원재료')
+    수불부표('부자재 수불부', 부자재표, '기초 = 재무제표 수불부 파일 · 입고 = 재고 매입내역 · 재고조정은 원재료 수불부 한 줄로 맞춥니다 (퀵북 재고 계정은 원재료·부자재를 나누지 않습니다)', '부자재')
+    if len(제품표):
+        수불부표('제품 수불부', 제품표,
+               '기초·입고·출고 = 재무제표 수불부 파일의 제품 줄 (입고수량은 반기말 제품재고를 포함해 거꾸로 계산된 값이라 따로 대조하지 않습니다) · '
+               '출고수량은 아래에서 매출자료(출고 내역)와 대조합니다', '제품')
+        # ── 검증 : 출고수량 = 매출자료 수량 · 기초+입고 ≥ 판매
+        수량다름 = 제품검증[제품검증['수량 차이'].abs() > 0.001]
+        부족 = 제품검증[제품검증['부족수량'] > 0.001]
+        c1, c2 = st.columns(2)
+        with c1:
+            if len(출고) == 0:
+                st.info('출고 내역 파일이 없어 출고수량 대조를 못 했습니다.')
+            elif len(수량다름) == 0:
+                st.success(f'제품 출고수량이 매출자료와 전 품목 같습니다 — {제품검증["수불 출고수량"].sum():,.0f}개 '
+                           f'(매출액 {금액(float(제품검증["매출액(출고내역)"].sum()))} = 원장 매출).')
+            else:
+                st.warning(f'출고수량이 매출자료와 다른 품목 {len(수량다름)}개')
+                st.dataframe(수량다름[['품목코드', '품목명', '수불 출고수량', '매출자료 수량', '수량 차이']], width='stretch', hide_index=True)
+        with c2:
+            if len(부족) == 0:
+                st.success('모든 제품에서 기초재고 + 입고수량 ≥ 판매수량 입니다 (기말수량 음수 없음).')
+            else:
+                st.warning(f'기초 + 입고 보다 판매가 많은 제품 {len(부족)}개')
+                st.dataframe(부족[['품목코드', '품목명', '기초+입고', '판매수량', '부족수량']], width='stretch', hide_index=True)
+    else:
+        st.info('제품 수불부는 재무제표 파일(「수불부」 시트)을 올리시면 그려집니다.')
 
     # 엑셀 내려받기
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as xw:
         원재료표.to_excel(xw, sheet_name='원재료 수불부', index=False)
         부자재표.to_excel(xw, sheet_name='부자재 수불부', index=False)
+        if len(제품표):
+            제품표.to_excel(xw, sheet_name='제품 수불부', index=False)
+            제품검증.to_excel(xw, sheet_name='제품 출고 대조', index=False)
     st.download_button('재고수불부 엑셀 내려받기', data=buf.getvalue(),
                        file_name=f'OTC 재고수불부_{당해연도}년 1~{보고월}월.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key='수불부다운')
     st.caption('원장 쪽 매입 = 재고(1300·1310·1320) 계정으로 들어온 Bill·Expense·Vendor Credit + 5100 Purchases + 5850 Packing Supplies '
-               '(재고 조정 분개·Invoice 제외) — 「매입관리」 화면의 원장 매입과 같은 금액입니다. '
-               '기초수량·금액과 출고(생산 소요)는 자료를 받으면 채웁니다.')
+               '(재고 조정 분개·Invoice 제외) — 「매입관리」 화면의 원장 매입과 같은 금액입니다. 원부자재 출고(생산 소요)는 BOM 자료를 받으면 채웁니다.')
     st.stop()
 
 if 메뉴 == '매입관리':
@@ -7393,6 +7620,123 @@ if 메뉴 == '매입관리':
         ② <b style="color:{T['ink2']}">BOM</b> (제품코드 · 자재코드 · 제품 1개당 소요량 · 단위)<br>
         두 파일을 올려 주시면 같은 자리에 이어서 만듭니다.
       </div></div></div>""")
+
+
+# ══════════════════════════════════════════════════════════════
+# 3-3. 원가관리 › 매출관리 — 출고(판매) 내역의 수량·판매금액과 퀵북 원장 매출을 거래처별로 견줍니다
+# ══════════════════════════════════════════════════════════════
+elif 메뉴 == '매출관리':
+    st.write(f'### 원가관리 › 매출관리 — {당해연도}년 1~{보고월}월')
+    st.caption('출고 내역(Sales by Customer Detail, 제품코드 정리본)의 수량·판매금액과 퀵북 원장의 매출을 '
+               '청구서 번호로 짝지어 거래처별로 견줍니다 · 통화 USD')
+    출고있음, 출고이름, _크기, 출고때 = 보관자료(출고보관)
+    with st.expander('출고 내역 파일', expanded=not 출고있음):
+        st.caption('「raw (sales)」 시트(Customer · Transaction date · Num · 제품코드 · Quantity · Amount)가 든 엑셀을 올려 주세요. '
+                   '왼쪽 「설정 · 파일 업로드」 에 같이 올리셔도 됩니다.')
+        올린출고 = st.file_uploader('출고 내역 (.xlsx)', type=['xlsx'], key='출고업로드')
+        if 올린출고 is not None:
+            자료남기기(출고보관, 올린출고)
+            출고있음, 출고이름, _크기, 출고때 = 보관자료(출고보관)
+        if 출고있음:
+            st.caption(f'지금 쓰는 파일: {출고이름} ({datetime.datetime.fromtimestamp(출고때):%Y-%m-%d %H:%M} 올림)')
+    if not 출고있음:
+        st.info('출고 내역 파일을 올리시면 표가 그려집니다.')
+        st.stop()
+    try:
+        출고 = 출고내역읽기(보관바이트(출고보관))
+    except Exception as e:
+        st.error(f'출고 내역을 읽지 못했습니다: {e}')
+        st.stop()
+    출고 = 출고[출고['거래일'].dt.year.eq(당해연도) & 출고['월'].le(보고월)].copy()
+
+    # ── 원장 쪽 매출 (분류 = 매출) — 청구서 번호(Num)로 짝을 짓습니다
+    원장매출 = 당해원장[당해원장['분류'].eq('매출') & 당해원장['월'].le(보고월)].copy()
+    원장매출['청구서'] = 원장매출.get('전표번호', pd.Series('', index=원장매출.index)).fillna('').astype(str).str.strip()
+    원장매출['거래처'] = (원장매출['Customer'] if 'Customer' in 원장매출.columns else 원장매출['Name']).fillna(원장매출['Name']).fillna('').astype(str).str.strip()
+    원장매출['거래처(상위)'] = 원장매출['거래처'].str.split(':').str[0].str.strip()
+    출고합 = float(출고['금액'].sum()); 원장합 = float(원장매출['금액'].sum()); 수량합 = float(출고['수량'].sum())
+
+    # 청구서별 비교
+    a = 출고.groupby('청구서')['금액'].sum(); b = 원장매출.groupby('청구서')['금액'].sum()
+    청구서표 = pd.DataFrame({'출고내역': a, '원장': b}).fillna(0.0)
+    청구서표['차이'] = 청구서표['출고내역'] - 청구서표['원장']
+    다른청구서 = 청구서표[청구서표['차이'].abs() > 0.5].copy()
+    청구서거래처 = 출고.groupby('청구서')['거래처(상위)'].first().to_dict()
+    원장매출['거래처맞춤'] = 원장매출['청구서'].map(청구서거래처).fillna(원장매출['거래처(상위)'])
+
+    # 거래처별 비교
+    g1 = 출고.groupby('거래처(상위)').agg(수량=('수량', 'sum'), 출고금액=('금액', 'sum'), 청구서수=('청구서', 'nunique'))
+    g2 = 원장매출.groupby('거래처맞춤')['금액'].sum().rename('원장매출')
+    거래처표 = g1.join(g2, how='outer').fillna(0.0)
+    거래처표['차이'] = 거래처표['출고금액'] - 거래처표['원장매출']
+    거래처표 = 거래처표.reset_index().rename(columns={'index': '거래처', '거래처(상위)': '거래처'})
+    거래처표['크기'] = 거래처표[['출고금액', '원장매출']].abs().max(axis=1)
+    거래처표 = 거래처표.sort_values('크기', ascending=False).drop(columns='크기')
+
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="kpi-row" style="--n:5">
+      <div class="kpi-card"><div class="kpi-label">출고 수량 (수불)</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{수량합:,.0f} <span class="unit">개</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">출고 판매금액 (수불)</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(출고합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">퀵북 원장 매출</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원장합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">차이 (출고 − 원장)</div>
+        <div class="kpi-value {'warn' if abs(출고합 - 원장합) > 1 else 'ok'}" style="font-size:24px;font-weight:700">{금액(출고합 - 원장합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">금액이 다른 청구서</div>
+        <div class="kpi-value {'warn' if len(다른청구서) else 'ok'}" style="font-size:24px;font-weight:700">{len(다른청구서)}건 <span class="unit">/ {len(청구서표)}건</span></div></div>
+    </div></div>""")
+
+    줄들 = ''
+    for _i, r in 거래처표.iterrows():
+        차 = float(r['차이']); 꼴 = f' style="color:{ROSE};font-weight:700"' if abs(차) > 0.5 else ''
+        줄들 += (f'<tr class="sub"><td class="lft">{r["거래처"]}</td><td>{r["수량"]:,.0f}</td><td>{int(r["청구서수"])}</td>'
+                 f'<td><b>{금액(r["출고금액"])}</b></td><td><b>{금액(r["원장매출"])}</b></td><td{꼴}>{금액(차)}</td></tr>')
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
+      <div class="card"><h3>거래처별 매출 비교 <span class="unitbadge">단위 USD</span></h3>
+        <div class="sub">{당해연도}년 1~{보고월}월 · 원장 매출은 청구서 번호(Num)로 출고 내역의 거래처에 붙였습니다 ·
+          번호가 안 맞는 원장 줄은 원장의 거래처 이름 그대로 · 금액이 큰 곳부터</div>
+        <div class="stick"><table class="lined" style="min-width:900px; margin-top:8px">
+          <colgroup><col style="width:34%"><col style="width:12%"><col style="width:10%"><col style="width:15%"><col style="width:15%"><col style="width:14%"></colgroup>
+          <thead><tr><th>거래처</th><th>출고 수량</th><th>청구서</th><th>출고 판매금액</th><th>원장 매출</th><th>차이</th></tr></thead>
+          <tbody>{줄들}
+            <tr class="total"><td class="lft">합계</td><td>{수량합:,.0f}</td><td>{len(청구서표)}</td>
+              <td><b>{금액(출고합)}</b></td><td><b>{금액(원장합)}</b></td><td>{금액(출고합 - 원장합)}</td></tr></tbody></table></div>
+      </div></div>""")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        월표 = pd.DataFrame({'월': [f'{m}월' for m in range(1, 보고월 + 1)],
+                            '출고': [float(출고.loc[출고['월'].eq(m), '금액'].sum()) for m in range(1, 보고월 + 1)],
+                            '원장': [float(원장매출.loc[원장매출['월'].eq(m), '금액'].sum()) for m in range(1, 보고월 + 1)],
+                            '수량': [float(출고.loc[출고['월'].eq(m), '수량'].sum()) for m in range(1, 보고월 + 1)]})
+        줄들 = ''.join(f'<tr class="sub"><td class="lft">{r["월"]}</td><td>{r["수량"]:,.0f}</td><td>{금액(r["출고"])}</td>'
+                      f'<td>{금액(r["원장"])}</td><td>{금액(r["출고"] - r["원장"])}</td></tr>' for _i, r in 월표.iterrows())
+        st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="card"><h3>월별 비교 <span class="unitbadge">단위 USD</span></h3>
+          <div class="sub">출고 내역의 거래일 · 원장의 거래일 기준</div>
+          <table class="lined" style="margin-top:8px"><thead><tr><th>월</th><th>출고 수량</th><th>출고 판매금액</th><th>원장 매출</th><th>차이</th></tr></thead>
+          <tbody>{줄들}<tr class="total"><td class="lft">합계</td><td>{수량합:,.0f}</td><td>{금액(출고합)}</td><td>{금액(원장합)}</td><td>{금액(출고합 - 원장합)}</td></tr></tbody></table>
+          </div></div>""")
+    with c2:
+        if len(다른청구서):
+            다른청구서 = 다른청구서.reset_index().rename(columns={'index': '청구서'})
+            원장쪽거래처 = 원장매출.groupby('청구서')['거래처(상위)'].first().to_dict()
+            다른청구서['거래처'] = 다른청구서['청구서'].map(청구서거래처).fillna(다른청구서['청구서'].map(원장쪽거래처)).fillna('')
+            줄들 = ''.join(f'<tr class="sub"><td class="lft">{r["청구서"]}</td><td class="lft">{r["거래처"]}</td><td>{금액(r["출고내역"])}</td>'
+                          f'<td>{금액(r["원장"])}</td><td style="color:{ROSE}">{금액(r["차이"])}</td></tr>' for _i, r in 다른청구서.iterrows())
+            합차 = float(다른청구서['차이'].sum())
+            st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="card"><h3>금액이 다른 청구서 <span class="unitbadge">단위 USD</span></h3>
+              <div class="sub">한쪽에만 있거나 금액이 다른 청구서 번호 — 차이 합계 {금액(합차)} {'(서로 상계되어 총액은 같습니다)' if abs(합차) < 1 else ''}</div>
+              <table class="lined" style="margin-top:8px"><thead><tr><th>청구서</th><th>거래처</th><th>출고내역</th><th>원장</th><th>차이</th></tr></thead>
+              <tbody>{줄들}</tbody></table></div></div>""")
+        else:
+            st.success('모든 청구서의 금액이 출고 내역과 원장에서 같습니다.')
+
+    with st.expander('제품별 출고 수량 · 판매금액 (재고수불부의 제품 출고에 씁니다)'):
+        제품별 = (출고.groupby(['제품코드', '제품명']).agg(수량=('수량', 'sum'), 판매금액=('금액', 'sum'), 줄=('수량', 'size'))
+                  .reset_index().sort_values('판매금액', ascending=False))
+        st.dataframe(제품별, width='stretch', hide_index=True,
+                     column_config={'수량': st.column_config.NumberColumn(format='%,.0f'),
+                                    '판매금액': st.column_config.NumberColumn(format='%,.2f')})
 
 
 # ══════════════════════════════════════════════════════════════
