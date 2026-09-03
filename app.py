@@ -4486,6 +4486,7 @@ def 연결패키지캐시(원장바이트, 양식바이트):
 
 
 양식보관 = 기억자리('최근패키지양식.xlsx')    # 본사에서 받은 연결패키지 원본
+매입보관 = 기억자리('최근매입내역.xlsx')      # 재고 매입내역 (원재료·부자재 입고 + 단가표)
 패키지보관 = 기억자리('최근패키지.xlsx')      # 마지막으로 만든 연결패키지 재무제표
 
 
@@ -4729,10 +4730,12 @@ st.sidebar.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-메뉴목록 = ['실적보고', '미수채권 관리', '계정과목 상세', '데이터 점검',
+메뉴목록 = ['실적보고', '원가관리', '미수채권 관리', '계정과목 상세', '데이터 점검',
             '연결재무제표 패키지', '실적보고 엑셀작성', '월간실적']
 # 「실적보고」를 누르면 아래 세 화면이 펼쳐집니다 (맨 처음은 누적 실적보고)
 실적하위 = ['누적 실적보고', '당월 실적보고', '월별 실적보고']
+# 「원가관리」 아래 화면 — 입고관리(재고 매입내역 vs 퀵북 원장 매입)
+원가하위 = ['입고관리']
 # 「연결재무제표 패키지」도 같은 방식으로 네 화면을 거느립니다
 패키지하위 = ['재무제표', '주석사항']
 # 재무제표 화면 안에서 고르는 세 가지 (자동 번역을 막으려고 영문 약칭을 앞에 답니다)
@@ -5035,7 +5038,7 @@ IS서식 = [
     ('1.', '기본주당순손익', '', 2, None),
 ]
 
-접이메뉴 = {'실적보고': 실적하위, '연결재무제표 패키지': 패키지하위}
+접이메뉴 = {'실적보고': 실적하위, '원가관리': 원가하위, '연결재무제표 패키지': 패키지하위}
 보고서페이지 = ['1. Executive Summary', '2. P&L | 손익계산서', '3. SG&A | 판관비',
                 '4. 운영 KPI', '5. Sales Forecast']
 if 'rep_page' not in st.session_state:
@@ -5155,10 +5158,12 @@ def 자료종류(바이트):
         return '원장'                       # 퀵북 원장 원본
     if any(re.search(r'ledger|원장', s, re.I) for s in 시트):
         return '원장'
+    if any('매입' in s and ('원재료' in s or '부자재' in s) for s in 시트):
+        return '매입'                       # 재고 매입내역 (입고관리 화면)
     return ''
 
 
-종류이름 = {'실적': '실적 엑셀', '원장': '원장 원본', '양식': '연결패키지 양식'}
+종류이름 = {'실적': '실적 엑셀', '원장': '원장 원본', '양식': '연결패키지 양식', '매입': '재고 매입내역'}
 
 
 def 자료받기(파일들):
@@ -5174,6 +5179,8 @@ def 자료받기(파일들):
             _자리에쓰기(원장보관, 바이트, f.name)
         elif 종 == '양식':
             _자리에쓰기(양식보관, 바이트, f.name)
+        elif 종 == '매입':
+            _자리에쓰기(매입보관, 바이트, f.name)
         목록.append((f.name, 종))
     return 실적, 목록
 
@@ -6975,6 +6982,273 @@ elif 메뉴 == '월간실적':
         if not 목표매출 or not any(목표매출):
             st.caption('목표(Plan)는 실적파일 「월간보고_입력」 시트의 '
                        '「■ 월별 목표」 구역에 넣으시면 자동으로 표시됩니다.')
+
+# ══════════════════════════════════════════════════════════════
+# 3-2. 원가관리 › 입고관리 — 재고 매입내역(입고량 × 단가) 과 퀵북 원장의 매입을 거래처별로 견줍니다
+# ══════════════════════════════════════════════════════════════
+elif 메뉴 == '입고관리':
+    st.write(f'### 원가관리 › 입고관리 — {당해연도}년 1~{보고월}월')
+    st.caption('재고 매입내역(원재료·부자재 입고량 × 단가표 단가) 과 퀵북 원장에 적힌 매입 금액을 '
+               '거래처별로 나란히 놓고 봅니다 · 통화 USD')
+
+    # ── 재고 매입내역 파일 (한 번 올리면 남겨 둡니다)
+    매입있음, 매입이름, _크기, 매입때 = 보관자료(매입보관)
+    with st.expander('재고 매입내역 파일', expanded=not 매입있음):
+        st.caption('시트 4개 — 「원재료 매입」 「부자재 매입」 「원재료 단가표」 「부자재 단가표」 가 든 엑셀을 올려 주세요. '
+                   '왼쪽 「설정 · 파일 업로드」 에 다른 자료와 함께 올리셔도 됩니다.')
+        올린매입 = st.file_uploader('재고 매입내역 (.xlsx)', type=['xlsx'], key='매입업로드')
+        if 올린매입 is not None:
+            자료남기기(매입보관, 올린매입)
+            매입있음, 매입이름, _크기, 매입때 = 보관자료(매입보관)
+        if 매입있음:
+            st.caption(f'지금 쓰는 파일: {매입이름} '
+                       f'({datetime.datetime.fromtimestamp(매입때):%Y-%m-%d %H:%M} 올림)')
+        환율KRW = st.number_input('단가표에 원화(KRW) 단가가 섞여 있으면 이 환율로 USD 로 바꿉니다 (KRW/USD)',
+                                  min_value=100.0, max_value=5000.0, value=1400.0, step=10.0, key='매입환율')
+    if not 매입있음:
+        st.info('재고 매입내역 파일을 올리시면 표가 그려집니다.')
+        st.stop()
+
+    @st.cache_data(show_spinner=False)
+    def 매입내역읽기(바이트):
+        """→ (입고 DataFrame, 단가 없는 자재 목록, 시트 안내)"""
+        xls = pd.ExcelFile(io.BytesIO(바이트))
+        def 시트(단어들):
+            return next((s for s in xls.sheet_names if all(w in str(s) for w in 단어들)), None)
+        표들, 없는단가, 안내 = [], [], {}
+        for 구분 in ('원재료', '부자재'):
+            입고시트, 단가시트 = 시트([구분, '매입']), 시트([구분, '단가'])
+            if not 입고시트:
+                continue
+            d = pd.read_excel(xls, sheet_name=입고시트)
+            d.columns = [str(c).strip() for c in d.columns]
+            단가 = {}
+            if 단가시트:
+                p = pd.read_excel(xls, sheet_name=단가시트)
+                p.columns = [str(c).strip() for c in p.columns]
+                통화 = p['통화단위'].astype(str).str.upper().str.strip() if '통화단위' in p.columns else 'USD'
+                for 코드, 값, 화 in zip(p['자재코드'].astype(str).str.strip(), pd.to_numeric(p['단가'], errors='coerce'), 통화):
+                    단가[코드] = (float(값) if pd.notna(값) else 0.0, 화)
+            코드열 = next((c for c in d.columns if '코드' in c), None)
+            이름열 = next((c for c in d.columns if c in ('원료명', '자재명')), None)
+            d['구분'] = 구분
+            d['코드'] = d[코드열].astype(str).str.strip() if 코드열 else ''
+            d['자재명'] = d[이름열].astype(str) if 이름열 else ''
+            d['입고량'] = pd.to_numeric(d.get('입고량'), errors='coerce').fillna(0.0)
+            d['단가'] = d['코드'].map(lambda k: 단가.get(k, (np.nan, ''))[0])
+            d['통화'] = d['코드'].map(lambda k: 단가.get(k, (np.nan, ''))[1])
+            d['입고일'] = pd.to_datetime(d.get('입고일'), errors='coerce')
+            d['공급처'] = d.get('공급처', pd.Series('', index=d.index)).fillna('').astype(str).str.strip()
+            d['발주유형'] = d.get('발주유형', pd.Series('', index=d.index)).fillna('').astype(str).str.strip()
+            d['TYPE'] = d.get('TYPE', pd.Series('', index=d.index)).fillna('').astype(str).str.strip()
+            없는단가 += [(구분, str(k), str(nm)) for k, nm, v in zip(d['코드'], d['자재명'], d['단가'])
+                       if (pd.isna(v) or v == 0) and k and k != 'nan']
+            안내[구분] = {'시트': 입고시트, '줄': len(d), '단가시트': 단가시트}
+            표들.append(d)
+        if not 표들:
+            raise ValueError('「원재료 매입」 「부자재 매입」 시트를 찾지 못했습니다.')
+        return pd.concat(표들, ignore_index=True), 없는단가, 안내
+
+    try:
+        입고, 없는단가, 시트안내 = 매입내역읽기(보관바이트(매입보관))
+    except Exception as e:
+        st.error(f'재고 매입내역을 읽지 못했습니다: {e}')
+        st.stop()
+
+    # 금액 = 입고량 × 단가 (원화 단가는 환율로 나눕니다)
+    원화 = 입고['통화'].astype(str).str.upper().eq('KRW')
+    입고['금액'] = 입고['입고량'] * 입고['단가'].fillna(0.0) / np.where(원화, float(환율KRW), 1.0)
+    원화줄수 = int(원화.sum())
+    # 견줄 범위: 원장이 있는 달까지 · 발주유형 Purchase(돈 주고 산 것) · 입고(PO Received) 만
+    입고['월'] = 입고['입고일'].dt.month
+    범위 = 입고[입고['입고일'].dt.year.eq(당해연도) & 입고['월'].le(보고월)]
+    제외_무상 = 범위[범위['발주유형'].str.lower().ne('purchase')]
+    제외_조정 = 범위[범위['발주유형'].str.lower().eq('purchase') & ~범위['TYPE'].str.contains('Received', case=False, na=False)]
+    산것 = 범위[범위['발주유형'].str.lower().eq('purchase') & 범위['TYPE'].str.contains('Received', case=False, na=False)].copy()
+    이후 = 입고[입고['월'].gt(보고월) | 입고['입고일'].dt.year.ne(당해연도)]
+
+    # ── 원장 쪽: 재고(원재료) 계정으로 들어온 매입 + 손익의 원재료·부자재·포장재 매입
+    재고계정 = 당해원장['계정과목'].eq('원재료') & 당해원장['계정분류'].eq('BS')
+    손익매입 = 당해원장['활동세부'].isin(['원재료 매입', '부자재 매입', '포장재'])
+    원장매입 = 당해원장[(재고계정 | 손익매입) & 당해원장['월'].le(보고월)].copy()
+    거래유형 = 원장매입.get('Transaction type', pd.Series('', index=원장매입.index)).fillna('').astype(str)
+    # 재고 계정의 「Inventory Starting Value · Invoice · Journal Entry · Inventory Adjust」 는 매입이 아니라 재고 조정입니다
+    매입유형 = 거래유형.str.contains('Bill|Expense|Check|Vendor Credit|Credit Card', case=False, regex=True) | 거래유형.eq('')
+    원장매입 = 원장매입[매입유형].copy()
+    원장매입['순매입'] = 원장매입['Debit'] - 원장매입['Credit']
+    벤더열 = 원장매입['Vendor'] if 'Vendor' in 원장매입.columns else pd.Series(np.nan, index=원장매입.index)
+    원장매입['거래처'] = 벤더열.fillna(원장매입.get('Name')).fillna('(거래처 없음)').astype(str).str.strip()
+
+    # ── 거래처 이름 맞추기 (두 자료의 표기가 다릅니다: Univar ↔ Univar (Nexeo) Solution)
+    군더더기 = {'inc', 'llc', 'corp', 'co', 'ltd', 'company', 'solution', 'solutions', 'us', 'usa',
+               'the', 'of', 'america', 'group', 'lab', 'labs', 'korea', 'hq'}
+    별칭 = {'ctk hq': 'ctk', 'ctk korea': 'ctk', 'ctk co ltd': 'ctk', 'ctk cosmetics technics korea': 'ctk',
+           'ctk otc labs': 'ctk otc'}
+
+    def _정리(이름):
+        t = re.sub(r'[^a-z0-9가-힣 ]', ' ', str(이름).lower().replace('&', ' '))
+        t = re.sub(r'\s+', ' ', t).strip()
+        if t in 별칭:
+            return 별칭[t]
+        낱말 = [w for w in t.split() if w not in 군더더기]
+        return ' '.join(낱말) or t
+
+    def _닮음(a, b):
+        if not a or not b:
+            return 0
+        if a == b or a.replace(' ', '') == b.replace(' ', ''):
+            return 3
+        if a.startswith(b) or b.startswith(a) or f' {a} ' in f' {b} ' or f' {b} ' in f' {a} ':
+            return 2
+        wa, wb = a.split()[0], b.split()[0]
+        if wa == wb:
+            return 1
+        if len(wa) >= 5 and len(wb) >= 5 and wa[:5] == wb[:5]:
+            return 0.5
+        return 0
+
+    매입쪽 = 산것.groupby(['공급처', '구분'])['금액'].sum().unstack(fill_value=0.0)
+    for c in ('원재료', '부자재'):
+        if c not in 매입쪽.columns:
+            매입쪽[c] = 0.0
+    원장쪽 = 원장매입.groupby('거래처')['순매입'].sum()
+    원장정리 = {v: _정리(v) for v in 원장쪽.index}
+    짝 = {}                                    # 매입내역 공급처 → (원장 거래처, 점수)
+    for 공 in 매입쪽.index:
+        a = _정리(공)
+        후보 = sorted(((_닮음(a, b), v) for v, b in 원장정리.items()), reverse=True)
+        if 후보 and 후보[0][0] > 0:
+            짝[공] = (후보[0][1], 후보[0][0])
+    근거말 = {3: '이름 같음', 2: '이름 포함', 1: '첫 단어 같음', 0.5: '앞 글자 비슷'}
+
+    # 묶음 만들기: 원장 거래처 하나에 매입내역 공급처 여럿이 붙을 수 있습니다
+    묶음 = collections.OrderedDict()
+    for 공 in 매입쪽.index:
+        키 = 짝[공][0] if 공 in 짝 else f'__{공}'
+        묶음.setdefault(키, {'매입공급처': [], '원장거래처': (짝[공][0] if 공 in 짝 else ''), '근거': []})
+        묶음[키]['매입공급처'].append(공)
+        if 공 in 짝:
+            묶음[키]['근거'].append(근거말[짝[공][1]])
+    for v in 원장쪽.index:
+        if v not in 묶음:
+            묶음[v] = {'매입공급처': [], '원장거래처': v, '근거': []}
+    줄 = []
+    for 키, g in 묶음.items():
+        원 = float(매입쪽.loc[g['매입공급처'], '원재료'].sum()) if g['매입공급처'] else 0.0
+        부 = float(매입쪽.loc[g['매입공급처'], '부자재'].sum()) if g['매입공급처'] else 0.0
+        장 = float(원장쪽.get(g['원장거래처'], 0.0)) if g['원장거래처'] else 0.0
+        줄.append({'매입내역 공급처': ' · '.join(g['매입공급처']) or '—',
+                   '원장 거래처': g['원장거래처'] or '—',
+                   '원재료': 원, '부자재': 부, '매입내역 합계': 원 + 부, '원장 매입': 장,
+                   '차이': 원 + 부 - 장, '맞춘 근거': ' · '.join(sorted(set(g['근거']))) or
+                   ('원장에만 있음' if not g['매입공급처'] else '매입내역에만 있음')})
+    비교 = pd.DataFrame(줄)
+    비교['크기'] = 비교[['매입내역 합계', '원장 매입']].abs().max(axis=1)
+    비교 = 비교.sort_values('크기', ascending=False).drop(columns='크기').reset_index(drop=True)
+
+    매입합 = float(산것['금액'].sum()); 원재료합 = float(산것.loc[산것['구분'].eq('원재료'), '금액'].sum())
+    부자재합 = 매입합 - 원재료합; 원장합 = float(원장매입['순매입'].sum())
+    맞은수 = int((비교['맞춘 근거'].str.contains('같음|포함|비슷')).sum())
+
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="kpi-row" style="--n:5">
+      <div class="kpi-card"><div class="kpi-label">매입내역 · 원재료</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원재료합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">매입내역 · 부자재</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(부자재합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">매입내역 합계 (입고량×단가)</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(매입합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">퀵북 원장 매입</div>
+        <div class="kpi-value" style="font-size:24px;font-weight:700">{금액(원장합)} <span class="unit">USD</span></div></div>
+      <div class="kpi-card"><div class="kpi-label">차이 (매입내역 − 원장)</div>
+        <div class="kpi-value {'warn' if abs(매입합 - 원장합) > 1 else 'ok'}" style="font-size:24px;font-weight:700">{금액(매입합 - 원장합)}
+          <span class="unit">({(매입합 - 원장합) / 원장합 * 100 if 원장합 else 0:,.1f}%)</span></div></div>
+    </div></div>""")
+
+    # ── 거래처별 비교표
+    줄들 = ''
+    for _i, 행 in 비교.iterrows():
+        차 = float(행['차이'])
+        색 = '' if abs(차) < 1 else (f' style="color:{ROSE};font-weight:700"' if abs(차) > 0.2 * max(abs(행['매입내역 합계']), abs(행['원장 매입']), 1) else '')
+        줄들 += (f'<tr class="sub"><td class="lft">{행["매입내역 공급처"]}</td><td class="lft">{행["원장 거래처"]}</td>'
+                 f'<td>{금액(행["원재료"])}</td><td>{금액(행["부자재"])}</td><td><b>{금액(행["매입내역 합계"])}</b></td>'
+                 f'<td><b>{금액(행["원장 매입"])}</b></td><td{색}>{금액(차)}</td>'
+                 f'<td class="lft muted">{행["맞춘 근거"]}</td></tr>')
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
+      <div class="card"><h3>거래처별 매입 비교 <span class="unitbadge">단위 USD</span></h3>
+        <div class="sub">{당해연도}년 1~{보고월}월 · 매입내역은 발주유형 「Purchase」·입고(PO Received) 줄만 · 금액이 큰 곳부터 ·
+          이름이 다른 거래처는 비슷한 이름끼리 자동으로 붙였습니다 (맨 오른쪽 「맞춘 근거」) · 자동으로 붙인 거래처 {맞은수}곳</div>
+        <div class="stick"><table class="lined" style="min-width:1080px; margin-top:8px">
+          <colgroup><col style="width:19%"><col style="width:19%"><col style="width:10%"><col style="width:10%">
+            <col style="width:11%"><col style="width:11%"><col style="width:10%"><col style="width:10%"></colgroup>
+          <thead><tr><th>매입내역 공급처</th><th>원장 거래처</th><th>원재료</th><th>부자재</th><th>매입내역 합계</th>
+            <th>원장 매입</th><th>차이</th><th>맞춘 근거</th></tr></thead>
+          <tbody>{줄들}
+            <tr class="total"><td class="lft">합계</td><td></td><td>{금액(원재료합)}</td><td>{금액(부자재합)}</td>
+              <td><b>{금액(매입합)}</b></td><td><b>{금액(원장합)}</b></td><td>{금액(매입합 - 원장합)}</td><td></td></tr></tbody></table></div>
+      </div></div>""")
+
+    # ── 월별 비교 + 원장 계정별 내역
+    c1, c2 = st.columns(2)
+    with c1:
+        월표 = pd.DataFrame({
+            '월': [f'{m}월' for m in range(1, 보고월 + 1)],
+            '매입내역': [float(산것.loc[산것['월'].eq(m), '금액'].sum()) for m in range(1, 보고월 + 1)],
+            '원장 매입': [float(원장매입.loc[원장매입['월'].eq(m), '순매입'].sum()) for m in range(1, 보고월 + 1)]})
+        줄들 = ''.join(f'<tr class="sub"><td class="lft">{r["월"]}</td><td>{금액(r["매입내역"])}</td>'
+                      f'<td>{금액(r["원장 매입"])}</td><td>{금액(r["매입내역"] - r["원장 매입"])}</td></tr>'
+                      for _i, r in 월표.iterrows())
+        st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="card"><h3>월별 비교 <span class="unitbadge">단위 USD</span></h3>
+          <div class="sub">매입내역은 입고일, 원장은 거래일 기준이라 달이 어긋날 수 있습니다</div>
+          <table class="lined" style="margin-top:8px"><thead><tr><th>월</th><th>매입내역</th><th>원장 매입</th><th>차이</th></tr></thead>
+          <tbody>{줄들}<tr class="total"><td class="lft">합계</td><td>{금액(매입합)}</td><td>{금액(원장합)}</td><td>{금액(매입합 - 원장합)}</td></tr></tbody></table>
+          </div></div>""")
+    with c2:
+        계정표 = (원장매입.groupby(['계정영문', '계정과목'])['순매입'].sum().reset_index()
+                  .sort_values('순매입', ascending=False))
+        줄들 = ''.join(f'<tr class="sub"><td class="lft">{r["계정영문"]}</td><td class="lft">{r["계정과목"]}</td>'
+                      f'<td>{금액(r["순매입"])}</td></tr>' for _i, r in 계정표.iterrows())
+        st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="card"><h3>원장에서 매입으로 본 계정 <span class="unitbadge">단위 USD</span></h3>
+          <div class="sub">재고(원재료) 계정으로 들어온 Bill·Expense·Vendor Credit + 손익의 원재료·부자재·포장재 매입 ·
+            재고 조정(Journal Entry · Inventory Adjust · Invoice) 은 뺐습니다</div>
+          <table class="lined" style="margin-top:8px"><thead><tr><th>계정</th><th>계정과목</th><th>순매입 (차변−대변)</th></tr></thead>
+          <tbody>{줄들}<tr class="total"><td class="lft">합계</td><td></td><td>{금액(원장합)}</td></tr></tbody></table>
+          </div></div>""")
+
+    # ── 매입내역에서 뺀 것 · 단가 없는 자재
+    무상 = 제외_무상.groupby(['구분', '공급처']).agg(줄=('입고량', 'size'), 입고량=('입고량', 'sum')).reset_index()
+    with st.expander(f'매입내역에서 금액을 세지 않은 것 — 무상 지급(Provided) {len(제외_무상):,}줄 · 재고 조정 {len(제외_조정):,}줄 · '
+                     f'{보고월}월 이후 입고 {len(이후):,}줄 · 단가 없는 자재 {len(set(k for _g, k, _n in 없는단가)):,}개'):
+        st.caption('발주유형이 「Provided」 인 줄은 고객·본사가 무상으로 준 자재라 매입 금액이 없습니다. '
+                   '단가표에 단가가 없거나 0 인 자재는 금액이 0 으로 잡혀 원장보다 작게 나옵니다.'
+                   + (f' 원화(KRW) 단가 자재 {원화줄수}줄은 환율 {환율KRW:,.0f} 으로 나눠 USD 로 잡았습니다.' if 원화줄수 else ''))
+        if len(무상):
+            st.dataframe(무상, width='stretch', hide_index=True)
+        if 없는단가:
+            단가표 = pd.DataFrame(sorted(set(없는단가)), columns=['구분', '자재코드', '자재명'])
+            산것단가없음 = 산것[산것['단가'].isna() | 산것['단가'].eq(0)]
+            st.caption(f'단가 없는 자재 가운데 「Purchase」 로 산 것 {len(산것단가없음):,}줄 — 이 줄들은 금액이 0 입니다')
+            st.dataframe(단가표, width='stretch', hide_index=True)
+
+    # ── 입고 상세 (자재별)
+    with st.expander('입고 상세 — 자재별 (Purchase 만)'):
+        상세 = (산것.groupby(['구분', '공급처', '코드', '자재명'])
+                .agg(입고량=('입고량', 'sum'), 단가=('단가', 'first'), 금액=('금액', 'sum'), 줄=('입고량', 'size'))
+                .reset_index().sort_values('금액', ascending=False))
+        st.dataframe(상세, width='stretch', hide_index=True,
+                     column_config={'입고량': st.column_config.NumberColumn(format='%,.2f'),
+                                    '단가': st.column_config.NumberColumn(format='%,.2f'),
+                                    '금액': st.column_config.NumberColumn(format='%,.0f')})
+
+    # ── 다음 단계: BOM 소요량
+    st.html(f"""{CARD_CSS}<div class="wrap" translate="no"><div class="card"><h3>다음 단계 — 생산수량 × BOM 소요량</h3>
+      <div style="font-size:13.5px; line-height:1.85; color:{T['ink3']}">
+        매출수량으로 생산된 제품수량을 확인하고, 제품마다 BOM(자재 소요량)을 곱해 <b style="color:{T['ink2']}">이론 소요량</b>을 구한 뒤
+        위 입고량·재고와 견주는 화면입니다. 그리려면 자료 두 가지가 더 필요합니다 —<br>
+        ① <b style="color:{T['ink2']}">제품별 생산(또는 매출) 수량</b> (제품코드 · 월 · 수량)<br>
+        ② <b style="color:{T['ink2']}">BOM</b> (제품코드 · 자재코드 · 제품 1개당 소요량 · 단위)<br>
+        두 파일을 올려 주시면 같은 자리에 이어서 만듭니다.
+      </div></div></div>""")
+
 
 # ══════════════════════════════════════════════════════════════
 # 4. 미수채권 관리
