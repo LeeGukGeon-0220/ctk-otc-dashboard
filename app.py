@@ -649,7 +649,7 @@ def _날짜열맞추기(칸):
             return pd.Timestamp(v).normalize()
         if isinstance(v, datetime.date):
             return pd.Timestamp(v)
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
+        if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
             # 날짜 서식이 빠진 칸은 엑셀 일련번호(46196 같은 숫자)로 옵니다 — 그것도 날짜로 읽습니다
             if 20000 < float(v) < 80000:
                 return pd.Timestamp(datetime.date(1899, 12, 30) + datetime.timedelta(days=int(v)))
@@ -754,6 +754,8 @@ def _표준화(df, 매핑표, 연도힌트, 재분류=None):
     if 매핑표.get('cls'):
         분류값 = k.map(매핑표['cls']).fillna(분류값)
     df['분류'] = np.where(df['계정분류'].eq('IS'), 분류값, None)
+    # 제조비율 — 판관비 계정 금액 가운데 제품매출원가로 나눠 보는 몫 (BS_IS_매핑 「제조비율」 열)
+    df['제조비율'] = k.map(매핑표.get('ratio', {})).fillna(0.0).astype(float)
 
     # 원장 양식에 따라 열 이름이 「활동분류」이기도 하고 「활동분류(대분류)」이기도 합니다.
     # ★둘 중 어느 쪽이 와도 같게 읽어야 합니다★ — 안 그러면 판관비가 전부 「기타관리경비」로 잡힙니다.
@@ -837,7 +839,14 @@ def _매핑표만들기(m):
     if 분류col is not None:
         cls = {k: str(v).strip() for k, v in zip(key, m[분류col])
                if isinstance(v, str) and str(v).strip() in ('매출', '매출원가', '판관비', '영업외손익', '법인세')}
-    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])), 'cls': cls,
+    # 「제조비율」 열 — 그 계정 금액 가운데 제품매출원가로 보는 몫 (예: 인건비 0.16). 없으면 0
+    비율col = next((c for c in m.columns if str(c).strip() == '제조비율'), None)
+    ratio = {}
+    if 비율col is not None:
+        for k, v in zip(key, pd.to_numeric(m[비율col], errors='coerce')):
+            if pd.notna(v) and 0 < float(v) <= 1:
+                ratio[k] = float(v)
+    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])), 'cls': cls, 'ratio': ratio,
             'table': m.rename(columns={영문col: '계정(영문)', bsiscol: 'BS/IS',
                                        korcol: '계정과목(한글)'})}
 
@@ -1430,21 +1439,25 @@ def 손익표(df, 기준='손익', 상위=7):
     기준='활동' : 판관비를 활동분류(보고항목) 14개로 나눔
     어느 쪽이든 매출액·영업이익·EBITDA 같은 합계 줄은 똑같습니다.
     """
-    d = df[df['계정분류'].eq('IS')]
+    d = df[df['계정분류'].eq('IS')].copy()
     수준 = {}                      # 줄마다 들여쓰기 단계 (0 굵게 / 1 / 2)
+    # 제조비율(BS_IS_매핑 H열)이 있는 판관비 계정은 그 몫만큼 제품매출원가로, 나머지는 판관비로 나눕니다
+    w = pd.to_numeric(d.get('제조비율'), errors='coerce').fillna(0.0).clip(0, 1) if '제조비율' in d.columns else pd.Series(0.0, index=d.index)
+    판관 = d['분류'].eq('판관비')
+    d['원가금액'] = np.where(d['분류'].eq('매출원가'), d['금액'], np.where(판관, d['금액'] * w, 0.0))
+    d['판관금액'] = np.where(판관, d['금액'] * (1 - w), 0.0)
 
-    def S(mask):
-        return d[mask].groupby('월')['금액'].sum().reindex(range(1, 13), fill_value=0.0)
+    def S(mask, 열='금액'):
+        return d[mask].groupby('월')[열].sum().reindex(range(1, 13), fill_value=0.0)
 
     o = {}
     o['매출액'] = S(d['분류'].eq('매출'))
     o['제품 매출'] = S(d['계정과목'].eq('제품매출'))
     o['상품 매출'] = S(d['계정과목'].eq('상품매출'))
     o['용역 매출'] = S(d['계정과목'].eq('용역매출'))
-    o['매출원가'] = -S(d['분류'].eq('매출원가'))
+    o['매출원가'] = -S(d['분류'].isin(['매출원가', '판관비']), '원가금액')
     o['매출총이익'] = o['매출액'] - o['매출원가']
-    판관 = d['분류'].eq('판관비')
-    o['판매관리비'] = -S(판관)
+    o['판매관리비'] = -S(판관, '판관금액')
     리스계정 = d['계정영문'].astype(str).str.strip().str.lower().str.startswith('6623')
 
     def 상각쪼개기(이름, 마스크, 부모유지):
@@ -1455,7 +1468,7 @@ def 손익표(df, 기준='손익', 상위=7):
                                     부모 자리를 감가상각비(리스 제외분)로 바꾸고
                                     리스상각비를 같은 단계로 나란히 놓습니다.
         """
-        리스분 = -S(마스크 & 리스계정)
+        리스분 = -S(마스크 & 리스계정, '판관금액')
         본체 = o[이름] - 리스분
         깊이 = 2 if 부모유지 else 1
         if 부모유지:
@@ -1469,16 +1482,16 @@ def 손익표(df, 기준='손익', 상위=7):
 
     if 기준 == '활동':
         for it in 판관비항목:
-            o[it] = -S(d['보고항목'].eq(it))
+            o[it] = -S(d['보고항목'].eq(it), '판관금액')
             수준[it] = 1
             if it == '상각비':
                 상각쪼개기(it, d['보고항목'].eq(it), 부모유지=True)
     else:
-        큰순 = (-d[판관].groupby('계정과목')['금액'].sum()).sort_values(ascending=False)
+        큰순 = (-d[판관].groupby('계정과목')['판관금액'].sum()).sort_values(ascending=False)
         고른계정 = [str(a) for a in 큰순.index[:상위] if str(a) != 'nan']
         for acc in 고른계정:
             마스크 = 판관 & d['계정과목'].eq(acc)
-            o[acc] = -S(마스크)
+            o[acc] = -S(마스크, '판관금액')
             수준[acc] = 1
             if acc in ('감가상각비', '무형자산상각비'):
                 상각쪼개기(acc, 마스크, 부모유지=False)
@@ -2082,7 +2095,7 @@ def _날짜일련(v):
     """엑셀이 쓰는 날짜 일련번호로 바꿉니다 (YEAR·MONTH 수식이 돌아가려면 숫자여야 합니다)."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return None
-    if isinstance(v, (int, float)) and not isinstance(v, bool):
+    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, (bool, np.bool_)):
         return int(v) if 20000 < float(v) < 80000 else None     # 이미 엑셀 일련번호
     if isinstance(v, str):
         p = v.strip().replace('-', '/').split('/')
@@ -2355,7 +2368,7 @@ def _매핑표읽기(z, 파일, 공유):
     ※ E·F 열(활동분류·활동세부)은 OTC 실적자료에만 있습니다. 없으면 빈 글자로 둡니다.
     """
     지도 = {}
-    for 행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C', 'E', 'F', 'G'), 공유).items():
+    for 행, 칸 in _시트칸읽기(z, 파일, ('A', 'B', 'C', 'E', 'F', 'G', 'H'), 공유).items():
         if 행 == 1:
             continue
         이름 = str(칸.get('A', '')).strip()
@@ -2364,7 +2377,8 @@ def _매핑표읽기(z, 파일, 공유):
                           str(칸.get('C', '')).strip(),
                           str(칸.get('E', '')).strip(),
                           str(칸.get('F', '')).strip(),
-                          str(칸.get('G', '')).strip())      # 분류 (있을 때만)
+                          str(칸.get('G', '')).strip(),      # 분류 (있을 때만)
+                          str(칸.get('H', '')).strip())      # 제조비율 (있을 때만)
     return 지도
 
 
@@ -6409,9 +6423,14 @@ if 메뉴 == '누적 실적보고':
     상품원가 = -접두합('cost of goods sold', 'inventory shrinkage')
     # 제품 직접원가 = 분류가 「매출원가」인 것 전부(상품원가 제외) — 담당자가 제품매출원가로 옮긴
     #  급여·임차료·전력비 등도 여기 들어갑니다 (BS_IS_매핑 「분류」 열 기준)
-    매출원가총 = -float(IS전.loc[IS전['분류'].eq('매출원가'), '금액'].sum())
+    비율w = (pd.to_numeric(IS전.get('제조비율'), errors='coerce').fillna(0.0).clip(0, 1)
+             if '제조비율' in IS전.columns else pd.Series(0.0, index=IS전.index))
+    판관마스크 = IS전['분류'].eq('판관비')
+    원가금액 = np.where(IS전['분류'].eq('매출원가'), IS전['금액'], np.where(판관마스크, IS전['금액'] * 비율w, 0.0))
+    매출원가총 = -float(원가금액.sum())
     공헌직접 = {'제품': 매출원가총 - 상품원가, '상품': 상품원가}
-    판관행 = IS전[IS전['분류'].eq('판관비')]
+    판관행 = IS전[판관마스크].copy()
+    판관행['금액'] = 판관행['금액'] * (1 - 비율w[판관마스크])     # 제조로 나눠 준 몫은 뺀 판관비
 
     def 과목합(*과목들):
         return -float(IS전.loc[IS전['계정과목'].isin(과목들), '금액'].sum())
