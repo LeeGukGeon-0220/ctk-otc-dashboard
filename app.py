@@ -846,7 +846,12 @@ def _매핑표만들기(m):
         for k, v in zip(key, pd.to_numeric(m[비율col], errors='coerce')):
             if pd.notna(v) and 0 < float(v) <= 1:
                 ratio[k] = float(v)
-    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])), 'cls': cls, 'ratio': ratio,
+    # 「변동고정」 열 — 공헌이익·손익분기점 계산에서 계정을 변동비/고정비로 나눌 때 우선하는 값
+    변고col = next((c for c in m.columns if str(c).strip() == '변동고정'), None)
+    vf = {}
+    if 변고col is not None:
+        vf = {k: str(v).strip() for k, v in zip(key, m[변고col]) if isinstance(v, str) and str(v).strip() in ('변동', '고정')}
+    return {'bsis': dict(zip(key, m[bsiscol])), 'kor': dict(zip(key, m[korcol])), 'cls': cls, 'ratio': ratio, 'vf': vf,
             'table': m.rename(columns={영문col: '계정(영문)', bsiscol: 'BS/IS',
                                        korcol: '계정과목(한글)'})}
 
@@ -2117,6 +2122,171 @@ def _날짜일련(v):
         except Exception:
             return None
     return (d - 엑셀기준일).days
+
+
+# 연결패키지(결산조정)를 보고 클로드가 원장에 손으로 넣어 둔 분개의 표시 — Description 맨 앞에 붙습니다.
+#   예) 감가상각비 : 26년 상반기 원장에 6800 전표가 없어 연결패키지 575,077.34 를 월 1/6 씩 넣어 둠 (2026.09.04)
+연결패키지표시 = '[연결패키지 반영]'
+
+
+def 연결패키지글(안내):
+    """엑셀작성 결과표에 보여 줄 한 줄 — 연결패키지 분개를 옮겼는지 / 원장에 진짜 전표가 들어와 뺐는지"""
+    if not 안내 or (not 안내.get('이어받음') and not 안내.get('제외')):
+        return '없음 (전월 자료에 「[연결패키지 반영]」 줄이 없거나 이번 원장에 이미 들어 있음)'
+    글 = []
+    if 안내.get('이어받음'):
+        글.append(f"{안내['이어받음']:,}줄 그대로 옮김 — 원장에 아직 없음 ({' · '.join(안내.get('이어받은계정', []))})")
+    if 안내.get('제외'):
+        글.append(f"{안내['제외']:,}줄 뺌 — 원장에 진짜 전표가 들어옴 ({' · '.join(안내.get('제외계정', []))})")
+    return ' / '.join(글)
+
+
+def _연결패키지줄이어받기(새, 전, 매핑표):
+    """전월 실적자료에 「[연결패키지 반영]」 으로 넣어 둔 분개 줄을 이번 원장에도 옮깁니다.
+
+    규칙(담당자 지시) : 그 비용 계정(IS 쪽)에 진짜 전표가 원장에 들어와 있으면 연결패키지를 보고 넣었던
+    줄은 빼고, 아직 원장에 없으면 그대로 넣습니다. 상대 계정(감가상각누계액 등 BS 쪽) 줄도 같이 움직입니다.
+    돌려주는 값 : (새, 안내 dict)  안내 = {'이어받음': 줄수, '제외': 줄수, '이어받은계정': [...], '제외계정': [...]}
+    """
+    A, B, C, D, G, H = (원장열자리[c] for c in 'ABCDGH')
+    I, J, K, L = (원장열자리[c] for c in 'IJKL')
+    안내 = {'이어받음': 0, '제외': 0, '이어받은계정': [], '제외계정': []}
+    if 'Description' not in 전.columns or len(전) == 0:
+        return 새, 안내
+    표시 = 전['Description'].astype(str).str.strip().str.startswith(연결패키지표시)
+    옛 = 전[표시]
+    if 옛.empty:
+        return 새, 안내
+    if G in 새.columns and 새[G].astype(str).str.strip().str.startswith(연결패키지표시).any():
+        return 새, 안내                     # 이번 원장(실적자료를 다시 넣은 경우)에 이미 들어 있음
+    전A = 전.columns[0]
+
+    def _계정쪽(이름):                      # 'IS' / 'BS'
+        if 이름 in 매핑표:
+            return 매핑표[이름][0] or ('IS' if str(이름)[:1] in '456789' else 'BS')
+        return 'IS' if str(이름)[:1] in '456789' else 'BS'
+
+    def _글(v):
+        return '' if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+    def _수(v):                              # 빈칸·NaN 은 0
+        v = pd.to_numeric(v, errors='coerce')
+        return 0.0 if v is None or pd.isna(v) else float(v)
+
+    새A = 새[A].map(_글) if A in 새.columns else pd.Series('', index=새.index)
+    새B = 새[B].map(_글)
+    새G = 새[G].map(_글) if G in 새.columns else pd.Series('', index=새.index)
+    새날 = 새[C] if C in 새.columns else pd.Series([None] * len(새), index=새.index)
+
+    # 표시 줄을 분개 묶음(같은 Description) 으로 모아, 묶음의 IS 계정에 진짜 전표가 있는지 봅니다
+    #   「Beginning Balance」 줄(연결 관점 기초잔액)은 위쪽 계정 머리글의 계정으로 봅니다
+    전머리 = 전[전A].map(_글).replace('', None).ffill()
+    def _계정(r):
+        b = _글(r[B])
+        return _글(전머리.loc[r.name]) if b == 'Beginning Balance' else b
+    묶음별 = {}
+    for _, r in 옛.iterrows():
+        묶음별.setdefault(_글(r['Description']), []).append(r)
+    넣을줄 = {}                              # 계정 → [옛 줄들]
+    for 글, 줄들 in 묶음별.items():
+        계정들 = {_계정(r) for r in 줄들}
+        # 감시할 계정 = 이 분개에서 비용을 「차변」 으로 잡은 IS 계정 (감가상각비 6800 · 수불부 5150 · 사용권자산 상각 6623 …)
+        #   대변 쪽 IS 계정(리스료를 덜어 낸 복리후생비 7100 등)은 원래 진짜 전표가 있는 계정이라 보지 않습니다
+        IS계정 = sorted({_계정(r) for r in 줄들 if _계정쪽(_계정(r)) == 'IS' and _수(r[I]) > 0})
+        진짜있음 = False
+        for a in IS계정:
+            실제 = 새[새B.eq(a) & 새날.notna() & ~새G.str.startswith(연결패키지표시)]
+            if len(실제):
+                진짜있음 = True
+        if 진짜있음:
+            안내['제외'] += len(줄들)
+            for a in 계정들:
+                if a not in 안내['제외계정']:
+                    안내['제외계정'].append(a)
+            continue
+        for r in 줄들:
+            넣을줄.setdefault(_계정(r), []).append(r)
+    if not 넣을줄:
+        return 새, 안내
+
+    # 이번 원장의 묶음(계정 머리글 ~ Total for) 자리
+    새 = 새.reset_index(drop=True)
+    머리 = {새A.iat[i]: i for i in range(len(새)) if 새A.iat[i] and not 새A.iat[i].startswith('Total')}
+    합계 = {새A.iat[i][len('Total for '):].strip(): i for i in range(len(새))
+            if 새A.iat[i].startswith('Total for ')}
+    조각, 끼움 = [], []                       # 끼움 : (끼울 자리(그 줄 앞), DataFrame)
+    빈줄 = {c: None for c in 새.columns}
+
+    def _새줄(r, 잔액):
+        d = dict(빈줄)
+        for c in 새.columns:
+            if c in r.index and c not in (A,):
+                v = r[c]
+                d[c] = None if (isinstance(v, float) and pd.isna(v)) else v
+        d[A] = None
+        d[L] = 잔액
+        return d
+
+    for 계정, 줄들 in 넣을줄.items():
+        줄들 = sorted(줄들, key=lambda r: (-1 if _글(r[B]) == 'Beginning Balance' else (_날짜일련(r[C]) or 0)))
+        차변 = sum(_수(r[I]) for r in 줄들)
+        대변 = sum(_수(r[J]) for r in 줄들)
+        if 계정 in 합계:                     # 이미 있는 묶음 → Total 줄 앞에 끼우고 Total 을 다시 셉니다
+            t = 합계[계정]
+            잔액 = 0.0
+            for i in range(t - 1, -1, -1):
+                v = pd.to_numeric(새.at[i, L], errors='coerce')
+                if 새B.iat[i] and not pd.isna(v):
+                    잔액 = float(v)
+                    break
+                if 새A.iat[i]:
+                    break
+            rows = []
+            줄들 = [r for r in 줄들 if _글(r[B]) != 'Beginning Balance']     # 기초잔액은 원장 것을 씁니다
+            if not 줄들:
+                continue
+            차변 = sum(_수(r[I]) for r in 줄들); 대변 = sum(_수(r[J]) for r in 줄들)
+            for r in 줄들:
+                잔액 = round(잔액 + _수(r[K]), 2)
+                rows.append(_새줄(r, 잔액))
+            끼움.append((t, pd.DataFrame(rows, columns=새.columns)))
+            새.at[t, I] = round(_수(새.at[t, I]) + 차변, 2)
+            새.at[t, J] = round(_수(새.at[t, J]) + 대변, 2)
+            새.at[t, K] = round(_수(새.at[t, K]) + 차변 - 대변, 2)
+        else:                               # 새 묶음 → 전월 자료에서 그 다음에 오던 계정 머리글 앞에
+            자리 = None
+            옛머리 = [(_글(전.at[i, 전A]), i) for i in range(len(전))
+                      if _글(전.at[i, 전A]) and not _글(전.at[i, 전A]).startswith('Total')]
+            뒤 = [n for n, i in 옛머리 if i > 줄들[0].name]
+            for n in 뒤:
+                if n in 머리:
+                    자리 = 머리[n]
+                    break
+            if 자리 is None:
+                자리 = len(새)
+            잔액 = 0.0
+            rows = [dict(빈줄, **{A: 계정})]
+            for r in 줄들:
+                if _글(r[B]) == 'Beginning Balance':
+                    잔액 = _수(r[L])
+                else:
+                    잔액 = round(잔액 + _수(r[K]), 2)
+                rows.append(_새줄(r, 잔액))
+            rows.append(dict(빈줄, **{A: f'Total for {계정}', I: round(차변, 2), J: round(대변, 2),
+                                       K: round(차변 - 대변, 2)}))
+            끼움.append((자리, pd.DataFrame(rows, columns=새.columns)))
+        안내['이어받음'] += len(줄들)
+        안내['이어받은계정'].append(계정)
+
+    끼움.sort(key=lambda x: x[0])
+    앞 = 0
+    for 자리, df in 끼움:
+        조각.append(새.iloc[앞:자리])
+        조각.append(df)
+        앞 = 자리
+    조각.append(새.iloc[앞:])
+    새 = pd.concat(조각, ignore_index=True)
+    return 새, 안내
 
 
 def _이어받기키(df):
@@ -3455,6 +3625,13 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
     z = zipfile.ZipFile(전bio)
     (올해시트, 올해파일), 시트목록 = _전월원장시트(z)
     전 = pd.read_excel(전bio, sheet_name=올해시트, header=4)
+    시트칸 = dict(_시트지도(z))
+    공유 = _공유글자(z)
+    매핑시트 = next((n for n in 시트칸 if 'BS_IS_매핑' in n), None)
+    매핑표 = _매핑표읽기(z, 시트칸[매핑시트], 공유) if 매핑시트 else {}
+
+    # ── 2-2. 연결패키지를 보고 넣어 둔 분개(감가상각비 등)는 원장에 진짜 전표가 없는 동안만 옮깁니다
+    새, 연결패키지안내 = _연결패키지줄이어받기(새, 전, 매핑표)
 
     # ── 3. 손으로 나눈 활동분류·검토메모 이어받기
     전키, 새키 = _이어받기키(전), _이어받기키(새)
@@ -3473,12 +3650,8 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
             이어받은수 = sum(1 for v in 이어받음[col] if v)
 
     # ── 3-2. 전월에 없던 새 거래는 지난달까지의 분류를 배워서 스스로 채웁니다
-    시트칸 = dict(_시트지도(z))
-    공유 = _공유글자(z)
     집계시트 = next((n for n in 시트칸 if '월별' in n and '실적집계' in n), None)
     유효세부 = set(_시트글자(z, 시트칸[집계시트], 'E', 공유)) if 집계시트 else set()
-    매핑시트 = next((n for n in 시트칸 if 'BS_IS_매핑' in n), None)
-    매핑표 = _매핑표읽기(z, 시트칸[매핑시트], 공유) if 매핑시트 else {}
     분류센것 = _자동분류(새, 이어받음, _분류학습(전), 유효세부, 매핑표)
 
     날짜들 = [d for d in (_날짜일련(v) for v in 새['Transaction date']) if d is not None]
@@ -3557,6 +3730,7 @@ def 실적보고엑셀만들기(원장바이트, 전월바이트):
                  ('계정기준표', '적요일치', '거래처일치', '계정과목대표값', '계정과목최빈값'))
     안내 = {'연도': 연도, '월끝': 월끝, '기간': 기간글, '올해시트': 올해시트,
             '행수': len(새), '거래건수': 거래, '이어받음': 이어받은수,
+            '연결패키지': 연결패키지안내,
             '새거래': int((~새키.isin(set(전키)) & 새['Distribution account'].notna()).sum()),
             '시트수': len(시트목록), '시트목록': 시트목록,
             '당월시트': 당월시트, '기준월맞춤': 달바뀜, '보고달': 보고달,
@@ -5224,6 +5398,48 @@ def _보고서이동(n):
     st.session_state['rep_page'] = n
 
 
+# ══ 접속 비밀번호 — 웹(Streamlit Cloud)에 올린 앱은 URL 만 알면 누구나 열 수 있어, 첫 화면에서 비밀번호를 받습니다.
+#   · 비밀번호는 코드에 적지 않고 Streamlit Cloud 의 「Settings → Secrets」 에 `앱비밀번호 = "…"` 로 넣습니다
+#     (로컬은 .streamlit/secrets.toml — 이 파일은 .gitignore 에 있어 GitHub 에 올라가지 않습니다)
+#   · Secrets 에 비밀번호가 없으면(로컬 실행 등) 예전처럼 바로 열립니다
+#   · 브라우저 탭을 닫거나 새로고침하면 다시 물어봅니다 (세션 단위)
+def _앱비밀번호():
+    try:
+        v = st.secrets.get('앱비밀번호', None) or st.secrets.get('APP_PASSWORD', None)
+    except Exception:            # secrets 파일 자체가 없을 때
+        return None
+    v = str(v).strip() if v is not None else ''
+    return v or None
+
+
+_비번 = _앱비밀번호()
+if _비번 and not st.session_state.get('_열림'):
+    import hmac as _hmac
+    st.markdown(f"""<style>
+      [data-testid="stSidebar"] {{ display:none; }}
+      .gate {{ max-width:420px; margin:12vh auto 0; padding:34px 36px 28px; border-radius:16px;
+              background:{T['panel']}; border:1px solid {T['line']}; box-shadow:0 8px 30px rgba(0,0,0,.10);
+              font-family:'Malgun Gothic','맑은 고딕',sans-serif; }}
+      .gate h1 {{ font-size:22px; font-weight:800; color:{T['headink']}; margin:0 0 4px; }}
+      .gate .sub {{ font-size:13px; color:{T['ink3']}; margin-bottom:18px; }}
+    </style>""", unsafe_allow_html=True)
+    _, 가운데, _ = st.columns([1, 1.2, 1])
+    with 가운데:
+        st.markdown('<div class="gate"><h1>CTK OTC LAB 실적보고</h1>'
+                    '<div class="sub">GROUP FINANCE VIEW · 접속 비밀번호를 입력해 주세요</div></div>',
+                    unsafe_allow_html=True)
+        with st.form('gate_form', border=False):
+            입력 = st.text_input('접속 비밀번호', type='password', label_visibility='collapsed',
+                                 placeholder='접속 비밀번호')
+            열기 = st.form_submit_button('열기', type='primary', use_container_width=True)
+        if 열기:
+            if _hmac.compare_digest(입력.strip(), _비번):
+                st.session_state['_열림'] = True
+                st.rerun()
+            else:
+                st.error('비밀번호가 맞지 않습니다.')
+    st.stop()
+
 with st.sidebar.container(key='nav_container'):
     st.caption('보기')
     for name in 메뉴목록:
@@ -5640,6 +5856,8 @@ if 메뉴 == '실적보고 엑셀작성':
               — Y열에서 「확인필요」로 걸러 보세요</span></td></tr>
         <tr class="sub"><td class="name">전월 자료에 없던 새 거래</td>
           <td class="lft">{안내['새거래']:,}건</td></tr>
+        <tr class="sub"><td class="name">연결패키지를 보고 넣은 분개</td>
+          <td class="lft">{연결패키지글(안내.get('연결패키지') or {})}</td></tr>
         <tr class="total"><td class="name">저장 위치</td>
           <td class="lft">{저장됨 or '(저장 안 됨 — 내려받기로 받아 주세요)'}</td></tr>
       </tbody>
@@ -6442,15 +6660,33 @@ if 메뉴 == '누적 실적보고':
     임차전 = 과목합('지급임차료')
     급여전 = 판관과목합('급여')
     복리전 = 판관과목합('복리후생비')
-    # 부분직접비 — 판관비에 남아 있는 고정성 비용(임차·상각)만. 제품매출원가로 옮긴 몫은 이미 직접원가입니다
-    부분직접총 = 판관과목합('감가상각비', '무형자산상각비') + 판관과목합('지급임차료')
     판관비총 = -float(판관행['금액'].sum())
-    공통비총 = 판관비총 - 부분직접총
-    공헌기준 = {c: 공헌매출[c] - 공헌직접.get(c, 0.0) for c in 공헌매출}
-    기준합 = sum(공헌기준.values())
     공헌매출합 = sum(공헌매출.values())
-    if 기준합 > 1 and 공헌매출합 > 1:
-        # 열 순서는 매출 규모 순으로 고정합니다
+
+    # ── 변동비 · 고정비 구분 ───────────────────────────────────────────
+    #   활동세부(BS_IS_매핑 F열) 이름으로 나눕니다. BS_IS_매핑에 「변동고정」 열을 두고 계정마다
+    #   「변동」/「고정」 을 적어 두면 그 값이 우선합니다 (담당자가 언제든 바꿀 수 있게).
+    변동세부 = {'원재료 직접출고원가', '부자재 직접출고원가', '원재료 매입', '부자재 매입', '매입운임', '직접노무비',
+                '시험·분석', '실험 소모품', '포장재', '팔레트', '기타 제조경비', '재고변동', '수불부 제품출고원가',
+                '재고평가손실', '재고감모손실', '창고 소모품', '상품매출원가', '출고 운반비', '견본비'}
+    세부열 = IS전['활동세부'].astype(str).str.strip() if '활동세부' in IS전.columns else pd.Series('', index=IS전.index)
+    덮어쓰기 = IS전['계정영문'].astype(str).str.strip().str.lower().map(매핑표.get('vf', {}))
+    변동마스크 = np.where(덮어쓰기.notna(), 덮어쓰기.eq('변동'), 세부열.isin(변동세부))
+    판관금액 = np.where(판관마스크, IS전['금액'] * (1 - 비율w), 0.0)
+    원가변동 = -float(원가금액[변동마스크].sum()); 원가고정 = 매출원가총 - 원가변동
+    판관변동 = -float(판관금액[변동마스크].sum()); 판관고정 = 판관비총 - 판관변동
+    변동비합 = 원가변동 + 판관변동; 고정비합 = 원가고정 + 판관고정
+    공헌합 = 공헌매출합 - 변동비합
+    공헌률 = 공헌합 / 공헌매출합 * 100 if 공헌매출합 else 0.0
+    변동률 = 변동비합 / 공헌매출합 * 100 if 공헌매출합 else 0.0
+    영익합 = 공헌합 - 고정비합
+    BEP = 고정비합 / (공헌률 / 100) if 공헌률 > 0 else None
+    # 항목별 구성 (표 아래 근거) — 활동세부별 합계
+    구성표 = pd.DataFrame({'세부': 세부열.values, '원가': -원가금액, '판관': -판관금액,
+                           '변동': 변동마스크}).groupby(['변동', '세부'], as_index=False)[['원가', '판관']].sum()
+
+    if 공헌매출합 > 1:
+        # 열 순서는 매출 규모 순으로 고정합니다 (오른쪽 매출 세부·거래처 표에서 씁니다)
         고정순서 = ['제품', '상품', '용역']
         공헌순서 = ([c for c in 고정순서 if c in 공헌매출]
                     + [c for c in 공헌매출 if c not in 고정순서])
@@ -6467,17 +6703,6 @@ if 메뉴 == '누적 실적보고':
             속성 = f' class="{cls}"' if cls else ''
             return f'<tr{속성}><td>{이름}{설명}</td>{칸들}</tr>'
 
-        매출값 = [공헌매출[c] for c in 공헌순서]
-        직접값 = [공헌직접.get(c, 0.0) for c in 공헌순서]
-        부분값 = [부분직접총 * 공헌기준[c] / 기준합 for c in 공헌순서]
-        공헌값 = [m - d - b for m, d, b in zip(매출값, 직접값, 부분값)]
-        률값 = [(cm / m * 100 if m else 0.0) for cm, m in zip(공헌값, 매출값)]
-        공통값 = [공통비총 * 공헌기준[c] / 기준합 for c in 공헌순서]
-        영익값 = [cm - co for cm, co in zip(공헌값, 공통값)]
-        공헌합, 공통합 = sum(공헌값), sum(공통값)
-        공헌률 = 공헌합 / 공헌매출합 * 100
-        고정창고 = 감가전 + 임차전
-
         def 합붙(값들, pct=False):
             return 값들 + [sum(값들)] if not pct else 값들
 
@@ -6487,65 +6712,118 @@ if 메뉴 == '누적 실적보고':
         칸수공헌 = len(공헌순서) + 1
         칸너비 = ('<colgroup><col style="width:19%">'
                   + f'<col style="width:{81 / 칸수공헌:.2f}%">' * 칸수공헌 + '</colgroup>')
-        공헌본문 = 공헌줄('매출액', 합붙(매출값), 'total')
-        공헌본문 += 공헌줄('직접원가', 합붙(직접값), calc='그 매출에만 붙는 비용')
-        공헌본문 += 공헌줄('부분직접비 *', 합붙(부분값))
-        공헌본문 += 공헌줄('공헌이익(손실)', 합붙(공헌값), 'cmhl')
-        공헌본문 += 공헌줄('공헌이익률', 률값 + [공헌률], 'cmrate', pct=True)
-        공헌본문 += 공헌줄('공통비 **', 합붙(공통값))
-        공헌본문 += 공헌줄('영업이익(손실)', 합붙(영익값), 'total')
+
+        # ── 공헌이익 표 : 매출액 → 변동비(매출원가·판관비) → 공헌이익 → 고정비(매출원가·판관비) → 영업이익
+        def 비율글(v):
+            return f'{v / 공헌매출합 * 100:,.1f}%' if 공헌매출합 else '-'
+
+        def 공헌행(이름, v, cls='', calc='', 비율=True):
+            설명 = f'<br><span class="calc" style="font-weight:500">{calc}</span>' if calc else ''
+            속성 = f' class="{cls}"' if cls else ''
+            return (f'<tr{속성}><td style="white-space:normal;line-height:1.35">{이름}{설명}</td><td>{CK(v)}</td><td>{CK(v / 보고월)}</td>'
+                    f'<td>{비율글(v) if 비율 else ""}</td></tr>')
+
+        공헌본문 = 공헌행('매출액', 공헌매출합, 'total')
+        공헌본문 += 공헌행('매출원가 중 변동비', 원가변동, calc='재료·직접노무·시험·포장 등 물량에 따라 늘어나는 원가')
+        공헌본문 += 공헌행('판관비 중 변동비', 판관변동, calc='출고 운반비 · 견본비')
+        공헌본문 += 공헌행('공헌이익(손실)', 공헌합, 'cmhl', calc=f'매출액 − 변동비 {CK(변동비합)}')
+        공헌본문 += (f'<tr class="cmrate"><td>공헌이익률 <span class="calc">(변동비율 {변동률:,.1f}%)</span></td>'
+                     f'<td>{공헌률:,.1f}%</td><td>{공헌률:,.1f}%</td><td></td></tr>')
+        공헌본문 += 공헌행('매출원가 중 고정비', 원가고정, calc='제조 인건비 · 건물(임차·전력 등) · 유형자산상각비')
+        공헌본문 += 공헌행('판관비 중 고정비', 판관고정, calc='관리 인건비 · 외부용역 · 보험 · ICT · 사용권자산 상각 등')
+        공헌본문 += 공헌행('영업이익(손실)', 영익합, 'total', calc=f'공헌이익 − 고정비 {CK(고정비합)}')
+
+        # ── 손익분기점(BEP) — 변동비는 매출에 비례해 늘고, 고정비는 BEP 까지 그대로라고 봅니다
+        if BEP:
+            배수 = BEP / 공헌매출합
+            부족 = BEP - 공헌매출합
+            단계 = [m for m in (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20) if m < 배수 - 0.05]
+            if len(단계) > 3:                                  # 너무 촘촘하면 고르게 3개만
+                단계 = [단계[round(i * (len(단계) - 1) / 2)] for i in range(3)]
+            열들 = [(1.0, '현재')] + [(m, f'{m:g}배') for m in 단계] + [(배수, 'BEP'), (배수 * 1.2, 'BEP +20%')]
+
+            def 민감줄(이름, fn, cls='', pct=False):
+                칸 = ''
+                for m, 이름2 in 열들:
+                    v = fn(m)
+                    강조 = ' style="font-weight:800"' if 이름2 == 'BEP' else ''
+                    if pct:
+                        칸 += f'<td{강조}>{(0.0 if abs(v) < 0.05 else v):,.1f}%</td>'
+                    else:
+                        칸 += f'<td{강조}>{CK(v) if abs(v * 배율 / 1000) >= 0.5 else "-"}</td>'
+                속 = f' class="{cls}"' if cls else ''
+                return f'<tr{속}><td>{이름}</td>{칸}</tr>'
+
+            민감머리 = ''.join(
+                f'<th{" style=%sbackground:%s%s" % (chr(34), T["accent"], chr(34)) if n == "BEP" else ""}>{n}<br>'
+                f'<span style="font-size:11px;font-weight:600;opacity:.85">×{m:,.2f}</span></th>' for m, n in 열들)
+            민감본문 = 민감줄('매출액', lambda m: 공헌매출합 * m, 'total')
+            민감본문 += 민감줄(f'변동비 <span class="calc">(매출의 {변동률:,.1f}%)</span>', lambda m: 변동비합 * m)
+            민감본문 += 민감줄('공헌이익', lambda m: 공헌합 * m, 'cmhl')
+            민감본문 += 민감줄('고정비 <span class="calc">(그대로)</span>', lambda m: 고정비합)
+            민감본문 += 민감줄('영업이익(손실)', lambda m: 공헌합 * m - 고정비합, 'total')
+            민감본문 += 민감줄('영업이익률', lambda m: (공헌합 * m - 고정비합) / (공헌매출합 * m) * 100, 'cmrate', pct=True)
+            BEP카드 = f"""
+        <div class="kpi-row" style="--n:3; margin-top:16px">
+          <div class="kpi-card" style="grid-column:span 2; border-left:4px solid {T['accent']}">
+            <div class="kpi-label">손익분기점(BEP) 매출액 <span class="calc">(1~{보고월}월 {보고월}개월 기준)</span></div>
+            <div class="kpi-value" style="font-size:38px;font-weight:800;color:{T['accent']}">{CK(BEP)} <span class="unit">{단위K}</span></div>
+            <div class="kpi-delta"><span class="muted">월 평균 <b>{CK(BEP / 보고월)}</b> {단위K} · 현재 매출의 <b>{배수:,.2f}배</b> ·
+              부족 매출 {CK(부족)} {단위K} (월 {CK(부족 / 보고월)})</span></div></div>
+          <div class="kpi-card"><div class="kpi-label">근거</div>
+            <div style="font-size:13px;line-height:1.8;color:{T['ink2']}">
+              고정비 <b>{CK(고정비합)}</b> ÷ 공헌이익률 <b>{공헌률:,.1f}%</b> = <b>{CK(BEP)}</b><br>
+              공헌이익률 = (매출 {CK(공헌매출합)} − 변동비 {CK(변동비합)}) ÷ 매출<br>
+              매출 1 이 늘면 변동비 {변동률 / 100:,.3f} 이 같이 늘고 {공헌률 / 100:,.3f} 이 남아 고정비를 갚습니다</div></div>
+        </div>
+        <div class="sub" style="margin-top:14px"><b>매출이 늘 때 손익</b> — 변동비는 매출 비율({변동률:,.1f}%)대로 늘고,
+          고정비 {CK(고정비합)} 은 BEP 까지 추가되지 않는다고 본 표 · 1~{보고월}월 누적 기준 · 단위 {단위K}</div>
+        <div class="scrollx"><table class="cmtab" style="min-width:0;width:100%;font-size:13px"><colgroup><col style="width:19%"></colgroup>
+        <thead><tr><th>구분</th>{민감머리}</tr></thead><tbody>{민감본문}</tbody></table></div>"""
+        else:
+            BEP카드 = (f'<div class="calcnote"><b>손익분기점을 구할 수 없습니다</b> — 공헌이익률이 {공헌률:,.1f}% 로 0 이하라 '
+                       f'매출이 늘어도 고정비를 갚지 못합니다. 변동비 구조부터 바꿔야 합니다.</div>')
+
+        # ── 항목 구성 (근거) ──
+        def 구성글(변동, 열):
+            d = 구성표[구성표['변동'].eq(변동) & (구성표[열].abs() > 0.5)].sort_values(열, ascending=False)
+            return ' · '.join(f'{r["세부"] or "(활동세부 없음)"} {CK(r[열])}' for _i, r in d.iterrows()) or '-'
+
         로컬열림 = ' open' if os.name == 'nt' else ''
         공헌카드 = f"""{CARD_CSS}<div class="wrap" translate="no">
-      <div class="card"><h3>공헌이익 분석 <span class="unitbadge">1~{보고월}월 누적 · 단위 {단위K}</span></h3>
-        <div class="sub">매출을 {len(공헌순서)}개 서비스로 나누고, 서비스에 직접 드는 비용(운송비 · 창고 인력 ·
-          감가상각/리스상각 · 임차료)을 뺀 것이 공헌이익입니다 ·
-          <b>영업이익 합계는 위 손익계산서와 정확히 일치합니다</b></div>
+      <div class="card"><h3>공헌이익 · 손익분기점 <span class="unitbadge">1~{보고월}월 누적 · 단위 {단위K}</span></h3>
+        <div class="sub">비용을 <b>변동비</b>(매출에 비례해 늘어나는 비용)와 <b>고정비</b>(매출과 상관없이 드는 비용)로 나눠,
+          매출액 − 변동비 = 공헌이익, 공헌이익 − 고정비 = 영업이익으로 봅니다 ·
+          <b>영업이익은 위 손익계산서와 정확히 일치합니다</b></div>
         <div class="kpi-row" style="--n:3">
           <div class="kpi-card"><div class="kpi-label">매출액 <span class="calc">(1~{보고월}월 누적)</span></div>
             <div class="kpi-value" style="font-size:24px;font-weight:700">{CK(공헌매출합)} <span class="unit">{단위K}</span></div></div>
           <div class="kpi-card"><div class="kpi-label">공헌이익(손실)</div>
             <div class="kpi-value" style="font-size:24px;font-weight:700">{CK(공헌합)} <span class="unit">{단위K}</span></div>
-            <div class="kpi-delta"><span class="muted">공헌이익률 {공헌률:,.1f}%</span></div></div>
+            <div class="kpi-delta"><span class="muted">공헌이익률 {공헌률:,.1f}% · 변동비율 {변동률:,.1f}%</span></div></div>
           <div class="kpi-card"><div class="kpi-label">영업이익(손실)</div>
-            <div class="kpi-value" style="font-size:24px;font-weight:700">{CK(sum(영익값))} <span class="unit">{단위K}</span></div>
-            <div class="kpi-delta"><span class="muted">공헌이익 − 공통비 {CK(공통합)}</span></div></div>
+            <div class="kpi-value" style="font-size:24px;font-weight:700">{CK(영익합)} <span class="unit">{단위K}</span></div>
+            <div class="kpi-delta"><span class="muted">공헌이익 − 고정비 {CK(고정비합)}</span></div></div>
         </div>
-        <div class="scrollx"><table class="cmtab">{칸너비}
-        <thead><tr><th style="white-space:normal">구분<br><span style="font-size:11px;font-weight:600;opacity:.8">(아래 %는 매출 비중)</span></th>
-        {머리}<th>합계</th></tr></thead>
+        <div class="scrollx"><table class="cmtab" style="min-width:0;width:100%">
+        <colgroup><col style="width:43%"><col style="width:19%"><col style="width:19%"><col style="width:19%"></colgroup>
+        <thead><tr><th>구분</th><th>1~{보고월}월 누적</th><th>월 평균</th><th>매출 대비</th></tr></thead>
         <tbody>{공헌본문}</tbody></table></div>
-        <div class="cmfoot">* <b>부분직접비</b> — 성격은 직접비이지만 원장에서 매출 갈래별 추적이 안 되는 비용
-          (공장·사무실 임차료 · 감가상각비) ·
-          <b>배부기준 : 매출액 − 직접원가 (실질 순매출) 비례</b><br>
-          ** <b>공통비</b> — 관리직 인건비(임원보수 · 사무직 급여 · 복리후생 · 급여세)와 그 밖의 판관비 · 배부기준 동일</div>
+        {BEP카드}
         <details class="calcnote"{로컬열림}>
-          <summary>직접원가 · 부분직접비 · 공통비 구성 <span class="hint">원장 계정 합계 · 누르면 펼쳐집니다</span></summary>
+          <summary>변동비 · 고정비 구성 <span class="hint">활동세부별 원장 합계 · 누르면 펼쳐집니다</span></summary>
           <div class="body">
-          <b>직접원가 {CK(sum(직접값))}</b> — 제품매출원가(분류 「매출원가」 전체 : 원재료·매입운임·직접노무·시험분석·
-          급여·임차료·전력비 등 제조로 옮긴 항목 포함) {CK(매출원가총 - 상품원가)} ·
-          상품원가(Cost of Goods Sold) {CK(상품원가)}<br>
-          <b>부분직접비 {CK(부분직접총)}</b> — 판관비에 남은 감가상각비·임차료
-          (감가상각비 전체 {CK(감가전)} · 지급임차료 전체 {CK(임차전)} 는 제품매출원가에 들어 있습니다)<br>
-          <b>공통비 {CK(공통비총)}</b> — 인건비(6000 급여) {CK(급여전)} ·
-          복리후생 · 급여세 {CK(복리전)} · 그 밖의 판관비(지급수수료 · 보험료 · 전력비 · 건물관리비 등)
-          {CK(공통비총 - 급여전 - 복리전)}</div></details>
-        <div class="calcnote"><b>왜 공헌이익이 관리비를 못 넘나</b> —
-          ① 공헌이익 {CK(공헌합)} ({공헌률:,.1f}%)로는 관리직 인건비를 포함한 공통비 {CK(공통합)}를
-          다 갚지 못해 영업손실 {CK(sum(영익값))}가 됩니다.
-          ② 가장 큰 원인은 공장 고정비 — 감가상각비 {CK(감가전)} + 임차료 {CK(임차전)}
-          = {CK(고정창고)}, 매출의 {고정창고 / 공헌매출합 * 100:,.0f}% 입니다.
-          ③ 배부는 「매출액 − 직접원가」(실질 순매출) 기준으로 했습니다 —
-          제품 매출의 실질 기여는 {CK(공헌기준.get('제품', 0.0))} 수준입니다.
-          ④ 감가상각 · 임차료 · 인건비는 고정비라, 물량이 늘면 새 매출의 약
-          {(부분직접총 / 기준합 * -100 + 100):,.0f}%가 남아 적자가 빠르게 줄어드는 구조입니다.
-          <span class="muted">(6000 급여의 생산직·관리직 구분, 5400 직접노무비와의 경계는 회계 담당자 확인 필요)</span></div>
+          <b>매출원가 중 변동비 {CK(원가변동)}</b> — {구성글(True, '원가')}<br>
+          <b>판관비 중 변동비 {CK(판관변동)}</b> — {구성글(True, '판관')}<br>
+          <b>매출원가 중 고정비 {CK(원가고정)}</b> — {구성글(False, '원가')}<br>
+          <b>판관비 중 고정비 {CK(판관고정)}</b> — {구성글(False, '판관')}<br>
+          <span class="muted">구분은 활동세부 이름으로 정했습니다 (직접노무비 5400 은 외주 생산인력이라 변동비로 봤습니다).
+          바꾸시려면 BS_IS_매핑 시트에 「변동고정」 열을 만들고 계정별로 「변동」/「고정」 을 적어 주세요 — 그 값이 우선합니다.</span></div></details>
       </div></div>"""
 
         # ── 왼쪽: 공헌이익 표 · 오른쪽: 고른 매출 구분의 거래처 세부 ──────
-        구분앞 = [('4111b', '출고'), ('4111c', '출고'), ('4111a', '입고'), ('4120', '보관'),
-                  ('4130', '배송'), ('4111d', '부가서비스'), ('4111e', '부가서비스'),
-                  ('4111f', '부가서비스'), ('4100', '기타'), ('4160', '기타'), ('4190', '기타'),
-                  ('4210', '상품'), ('4213', '상품'), ('4220', '상품'), ('sales of product', '상품')]
+        # OTC 법인 매출 계정 → 매출 구분 (공헌매출과 같은 기준)
+        구분앞 = [('4000', '제품'), ('sales retail', '상품'), ('services', '용역'), ('4100', '기타')]
 
         def _매출구분(s):
             for p, c in 구분앞:
@@ -6606,8 +6884,7 @@ if 메뉴 == '누적 실적보고':
             st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
       <div class="card"><h3>거래처별 매출 <span class="unitbadge">1~{보고월}월 누적 · 단위 {단위K}</span></h3>
         <div class="sub">누적 매출 상위 5개 거래처 + 기타 · 매출 구분별 ·
-          상품 순액 재분류(E0E0)는 EGONGEGONG 에서 차감했습니다 ·
-          아래에서 거래처를 고르면 그 업체의 손익이 나옵니다</div>
+          아래에서 거래처를 고르면 그 업체의 손익(변동비율·고정비 배부 추정)이 나옵니다</div>
         <div class="scrollx"><table class="cmtab">{칸너비}
         <thead><tr><th>거래처</th>{고객머리}<th>합계</th></tr></thead>
         <tbody>{고객본문}</tbody></table></div></div></div>""")
@@ -6619,45 +6896,28 @@ if 메뉴 == '누적 실적보고':
             # 상품원가(5200)는 무조건 상품매출원가 — 원장 거래처(재분류 E0E0 포함)로 추적하고,
             # 이름이 없는 잔여분만 거래처 총매출 비중으로 배부합니다. 나머지 직접원가(배송비·포워딩)는
             # 거래처 추적이 안 되므로 그 구분 매출에서 차지하는 비중으로 배부합니다.
-            오공마스크 = 영문소.str.startswith('5200')
-            상품원가별 = (-당해원장[오공마스크]
-                          .groupby(보정이름[오공마스크].fillna('(거래처 미기재)'))['금액'].sum())
-            상품원가잔여 = float(상품원가별.get('(거래처 미기재)', 0.0))
-            거래처총합 = float(거래처합.sum()) or 1.0
-            c직접 = []
-            for i, c in enumerate(공헌순서):
-                if c == '상품':
-                    c직접.append(float(상품원가별.get(거래처골라본, 0.0))
-                                 + 상품원가잔여 * float(거래처합.get(거래처골라본, 0.0)) / 거래처총합)
-                else:
-                    c직접.append(공헌직접.get(c, 0.0)
-                                 * (c매출[i] / 공헌매출[c] if 공헌매출[c] else 0.0))
-            c부분 = [부분직접총 * (m - d) / 기준합 for m, d in zip(c매출, c직접)]
-            c공헌 = [m - d - b for m, d, b in zip(c매출, c직접, c부분)]
+            # 변동비는 그 거래처 매출 × 전체 변동비율, 고정비는 매출 비중으로 나눈 추정치입니다
+            c변동 = [m * 변동률 / 100 for m in c매출]
+            c공헌 = [m - v for m, v in zip(c매출, c변동)]
             c률 = [(cm / m * 100 if m else 0.0) for cm, m in zip(c공헌, c매출)]
-            c공통 = [공통비총 * (m - d) / 기준합 for m, d in zip(c매출, c직접)]
-            c영익 = [cm - co for cm, co in zip(c공헌, c공통)]
+            c고정 = [고정비합 * (m / 공헌매출합 if 공헌매출합 else 0.0) for m in c매출]
+            c영익 = [cm - f for cm, f in zip(c공헌, c고정)]
             c매출합 = sum(c매출) or 1.0
             c본문 = 공헌줄('매출액', 합붙(c매출), 'total')
-            c본문 += 공헌줄('직접원가', 합붙(c직접),
-                            calc='상품원가는 원장 추적 · 배송비 등은 매출 비중 추정')
-            c본문 += 공헌줄('부분직접비 *', 합붙(c부분))
+            c본문 += 공헌줄('변동비', 합붙(c변동), calc=f'매출 × 변동비율 {변동률:,.1f}%')
             c본문 += 공헌줄('공헌이익(손실)', 합붙(c공헌), 'cmhl')
             c본문 += 공헌줄('공헌이익률', c률 + [sum(c공헌) / c매출합 * 100], 'cmblue', pct=True)
-            c본문 += 공헌줄('공통비 **', 합붙(c공통))
+            c본문 += 공헌줄('고정비', 합붙(c고정), calc='매출 비중으로 배부')
             c본문 += 공헌줄('영업이익(손실)', 합붙(c영익), 'total')
             st.html(f"""{CARD_CSS}<div class="wrap" translate="no">
       <div class="card"><h3><span class="notranslate" translate="no">{거래처골라본}</span> 손익
         <span class="unitbadge">1~{보고월}월 누적 · 단위 {단위K}</span></h3>
-        <div class="sub">위 공헌이익 분석과 같은 배부기준 — 상품원가(5200)는 원장 거래처로 추적(재분류
-          E0E0 = EGONGEGONG 상계 포함), 배송비·포워딩은 그 구분 매출 비중으로, 부분직접비·공통비는
-          실질 순매출 비례로 나눈 추정치입니다</div>
+        <div class="sub">위 공헌이익 분석과 같은 기준 — 변동비는 이 거래처 매출 × 전체 변동비율, 고정비는
+          매출 비중으로 나눈 추정치입니다</div>
         <div class="scrollx"><table class="cmtab">{칸너비}
         <thead><tr><th>구분</th>{고객머리}<th>합계</th></tr></thead>
         <tbody>{c본문}</tbody></table></div>
-        <div class="cmfoot">* <b>부분직접비</b> — 공장·사무실 임차료 · 감가상각비<br>
-          ** <b>공통비</b> — 인건비(급여 · 복리후생 · 급여세)와 그 밖의
-          판관비(지급수수료 · 보험료 · 전력비 · 건물관리비 · 수선비 등)</div></div></div>""")
+        </div></div>""")
 
     # ── 현금흐름 (왼쪽 3) + 항목별 거래처 세부내역 (오른쪽 1) ────────────
     if 자금표 is not None:
@@ -7432,6 +7692,18 @@ if 메뉴 == '재고수불부':
         수불부표('제품 수불부', 제품표,
                '기초·입고·출고 = 재무제표 수불부 파일의 제품 줄 (입고수량은 반기말 제품재고를 포함해 거꾸로 계산된 값이라 따로 대조하지 않습니다) · '
                '출고수량은 아래에서 매출자료(출고 내역)와 대조합니다', '제품')
+        # ── 수불부 제품 출고금액 = 손익계산서 「수불부 제품출고원가」 (퀵북 Cost of Goods Sold + 연결패키지 반영 분개)
+        수불출고액 = float(제품표['출고금액'].sum())
+        원가줄 = 당해원장[당해원장['활동세부'].astype(str).eq('수불부 제품출고원가') & 당해원장['월'].le(보고월)]
+        원장출고원가 = float((pd.to_numeric(원가줄['Debit'], errors='coerce').fillna(0)
+                            - pd.to_numeric(원가줄['Credit'], errors='coerce').fillna(0)).sum()) if len(원가줄) else 0.0
+        연결분 = 원가줄[원가줄['Description'].astype(str).str.startswith(연결패키지표시)] if 'Description' in 원가줄.columns else 원가줄.iloc[0:0]
+        연결액 = float((pd.to_numeric(연결분['Debit'], errors='coerce').fillna(0)
+                       - pd.to_numeric(연결분['Credit'], errors='coerce').fillna(0)).sum()) if len(연결분) else 0.0
+        차 = 수불출고액 - 원장출고원가
+        (st.success if abs(차) < 1 else st.warning)(
+            f'제품 출고금액 {금액(수불출고액)} = 손익계산서 「수불부 제품출고원가」 {금액(원장출고원가)} '
+            f'(퀵북 Cost of Goods Sold {금액(원장출고원가 - 연결액)} + 연결패키지 반영 분개 {금액(연결액)}) · 차이 {금액(차)}')
         # ── 검증 : 출고수량 = 매출자료 수량 · 기초+입고 ≥ 판매
         수량다름 = 제품검증[제품검증['수량 차이'].abs() > 0.001]
         부족 = 제품검증[제품검증['부족수량'] > 0.001]
